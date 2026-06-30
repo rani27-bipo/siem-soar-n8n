@@ -1,0 +1,1105 @@
+{
+  "name": "ORCH-000_Incident_Dispatcher",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "soar-dispatch",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1328,
+        400
+      ],
+      "id": "300df58b-07ef-4ea9-9f52-55a9ba264f71",
+      "name": "Incident_Receiver",
+      "webhookId": "444db809-4107-4035-867e-c7b9b9b4e0f5"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// ORCH-000 — Incident Dispatcher\n// VERSION CORRIGÉE FINALE — headers token fix\n// ============================================================\n\nconst raw = $input.first().json;\nconst ts  = new Date().toISOString();\n\n// ── TOKEN — lecture headers HTTP EN PRIORITÉ ──────────────\nconst receivedToken = String(\n  (raw.headers && raw.headers['x-soc-token']) ||\n  (raw.headers && raw.headers['X-Soc-Token']) ||\n  raw['x-soc-token'] ||\n  raw.soc_token       ||\n  (raw.body && raw.body['x-soc-token']) ||\n  (raw.body && raw.body.soc_token) || ''\n).trim();\n\nconst SOC_TOKEN = String($vars.ORCH_TOKEN || '').trim();\n\nif (!receivedToken) {\n  return [{ json: { error: 'UNAUTHORIZED', message: 'Token manquant',\n    _skip_db: true, timestamp: ts } }];\n}\nif (!SOC_TOKEN) {\n  return [{ json: { error: 'MISCONFIGURATION',\n    message: 'Variable ORCH_TOKEN non configurée',\n    _skip_db: true, timestamp: ts } }];\n}\nif (receivedToken !== SOC_TOKEN) {\n  console.log('[SECURITY][ORCH-000] Token invalide — ' + ts);\n  return [{ json: { error: 'UNAUTHORIZED',\n    message: 'Token SOC invalide — ORCH-000',\n    _skip_db: true, timestamp: ts } }];\n}\n\n// ── RÉSOLUTION DU BODY ─────────────────────────────────────\nlet input;\nif (raw.body && typeof raw.body === 'object' && raw.body.incident_type) {\n  input = raw.body;\n} else if (raw.incident_type) {\n  input = raw;\n} else {\n  input = raw.body || raw;\n}\n\nconst now      = new Date();\nconst userName = String(input.username || input.user || 'unknown').trim();\n\nfunction normalizeIP(raw_ip) {\n  const s = String(raw_ip || '').trim().toLowerCase();\n  if (s.startsWith('::ffff:')) return s.slice(7);\n  if (/^(\\d{1,3}\\.){3}\\d{1,3}$/.test(s)) {\n    const octets = s.split('.').map(Number);\n    if (octets.some(o => isNaN(o) || o < 0 || o > 255)) return '0.0.0.0';\n    return octets.join('.');\n  }\n  if (/^[0-9a-f:]{3,39}$/.test(s)) return s;\n  return '0.0.0.0';\n}\n\nconst sourceIP = normalizeIP(input.source_ip || input.ip || '0.0.0.0');\n\n// ── VALIDATION incident_type ───────────────────────────────\nconst VALID_INCIDENT_TYPES = [\n  'brute_force','phishing','data_exfil','port_scan','priv_escalation'\n];\nconst incidentType = String(input.incident_type || '').toLowerCase().trim();\nif (!incidentType || !VALID_INCIDENT_TYPES.includes(incidentType)) {\n  return [{ json: {\n    error        : 'INVALID_INCIDENT_TYPE',\n    received_type: incidentType.substring(0, 50),\n    valid_types  : VALID_INCIDENT_TYPES,\n    _skip_db     : true, timestamp: ts\n  }}];\n}\n\nconst priority = String(input.priority || 'P1').trim();\nconst VALID_PRIORITIES = ['P0','P1','P2','P3','P4'];\nlet safePriority = VALID_PRIORITIES.includes(priority) ? priority : 'P1';\n\n// ── CORRÉLATION + DÉDUPLICATION ───────────────────────────\nconst store  = $getWorkflowStaticData('global');\nconst safeIP = sourceIP.replace(/[.:]/g, '_');\nconst CORREL_WINDOW_MS = 3600000;\nlet correlEscalade = false;\nlet correlTypes    = [];\n\nObject.keys(store).forEach(k => {\n  if (!k.startsWith('DEDUP_' + safeIP + '_')) return;\n  const existingType = k.replace('DEDUP_' + safeIP + '_', '');\n  if (existingType === incidentType) return;\n  try {\n    const entry = JSON.parse(store[k]);\n    if ((now.getTime() - (entry.created_ts || 0)) < CORREL_WINDOW_MS) {\n      correlTypes.push(existingType);\n      correlEscalade = true;\n    }\n  } catch(e) {}\n});\n\nif (correlEscalade) {\n  safePriority = 'P0';\n  console.log('[ORCH-000] CORRÉLATION APT — IP: ' + sourceIP +\n    ' — Types: ' + correlTypes.join(',') + ' + ' + incidentType + ' → P0');\n}\n\n// ── DÉDUPLICATION ──────────────────────────────────────────\nconst dupKey   = 'DEDUP_' + safeIP + '_' + incidentType;\nconst existing = store[dupKey];\n\nif (existing) {\n  try {\n    const dupData    = JSON.parse(existing);\n    const ageMinutes = (now.getTime() - dupData.created_ts) / 60000;\n    if (ageMinutes < 15) {\n      dupData.dup_count = (dupData.dup_count || 1) + 1;\n      store[dupKey]     = JSON.stringify(dupData);\n      return [{ json: {\n        _deduplicated        : true,\n        _skip_db             : true,\n        _original_incident_id: dupData.incident_id,\n        _dup_count           : dupData.dup_count,\n        incident_type        : incidentType,\n        source_ip            : sourceIP,\n        status               : 'DEDUPLICATED'\n      }}];\n    } else {\n      delete store[dupKey];\n    }\n  } catch(e) { delete store[dupKey]; }\n}\n\n// ── PURGE DEDUP ────────────────────────────────────────────\nconst PURGE_KEY = '_last_purge_orch';\nconst lastPurge = store[PURGE_KEY] || 0;\nif ((now.getTime() - lastPurge) > 300000) {\n  store[PURGE_KEY] = now.getTime();\n  Object.keys(store).forEach(k => {\n    if (k.startsWith('DEDUP_')) {\n      try {\n        const e = JSON.parse(store[k]);\n        if ((now.getTime() - (e.created_ts || 0)) > 3600000) delete store[k];\n      } catch(err) { delete store[k]; }\n    }\n  });\n}\n\n// ── CRÉATION INCIDENT ──────────────────────────────────────\nconst pad  = (n, l) => String(n).padStart(l, '0');\nconst rand = Math.random().toString(36).substr(2, 6).toUpperCase();\nconst incId = 'INC-' + now.getFullYear() +\n              pad(now.getMonth() + 1, 2) +\n              pad(now.getDate(), 2) + '-' + rand;\n\nconst SLA     = { P0: 15, P1: 60, P2: 240, P3: 1440, P4: 4320 };\nconst sla_min = SLA[safePriority] || 60;\nconst sla_due = new Date(now.getTime() + sla_min * 60000).toISOString();\n\nconst SEVERITY_SCORES = { P0: 100, P1: 75, P2: 50, P3: 25, P4: 0 };\nconst fsmScores  = { q0: 0, q1: 25, q2: 50, q3: 75, q4: 100 };\nconst sev_score  = Number(input.severity_score || SEVERITY_SCORES[safePriority] || 75);\nconst fsm_score  = fsmScores[String(input.etat_siem || 'q3')] || 75;\nconst corr_bonus = correlEscalade ? 15 : 0;\nconst risk_score = Math.min(100,\n  Math.round(sev_score * 0.5 + fsm_score * 0.35 + corr_bonus * 0.15));\n\nlet mttd_minutes = 0;\nif (input.timestamp) {\n  try {\n    mttd_minutes = Math.max(0,\n      (now.getTime() - new Date(input.timestamp).getTime()) / 60000);\n    mttd_minutes = parseFloat(mttd_minutes.toFixed(2));\n  } catch(e) {}\n}\n\nconst auditEntry = now.toISOString() +\n  ' | OPEN | AUTO | Incident créé — Type: ' + incidentType +\n  ' — IP: ' + sourceIP + ' — Priority: ' + safePriority +\n  (correlEscalade ? ' — CORRÉLATION APT: ' + correlTypes.join(',') : '') +\n  ' — Risk: ' + risk_score + '/100';\n\nconst incident = {\n  incident_id   : incId,\n  incident_type : incidentType,\n  source_ip     : sourceIP,\n  ip            : sourceIP,\n  username      : userName,\n  user          : userName,\n  session_id    : String(input.session_id    || 'SESS-UNKNOWN'),\n  etat_siem     : String(input.etat_siem     || 'q3'),\n  timestamp     : String(input.timestamp     || now.toISOString()),\n  mitre_tech    : String(input.mitre_tech    || 'T1110'),\n  mitre_name    : String(input.mitre_name    || 'Brute Force'),\n  mitre_tactic  : String(input.mitre_tactic  || 'Credential Access'),\n  severity      : String(input.severity      || 'HIGH'),\n  severity_score: sev_score,\n  risk_score,\n  priority      : safePriority,\n  sla_minutes   : sla_min,\n  sla_due,\n  url           : String(input.url           || ''),\n  assigned_to   : 'SOC_L1_AUTO',\n  status        : 'TRIAGE',\n  etat_soar     : 'q1_Triage',\n  source        : 'SIEM_AFD',\n  correlated    : correlEscalade,\n  correl_types  : correlTypes.join(','),\n  mttd_minutes,\n  created_at    : now.toISOString(),\n  _skip_db      : false,\n  audit_trail   : [auditEntry]\n};\n\nstore[dupKey] = JSON.stringify({\n  incident_id: incId,\n  created_ts : now.getTime(),\n  dup_count  : 1,\n  session_id : incident.session_id\n});\n\nconsole.log('[ORCH-000] Incident créé: ' + incId +\n  ' — Type: ' + incidentType + ' — Priority: ' + safePriority +\n  ' — Risk: ' + risk_score + '/100' +\n  (correlEscalade ? ' — APT CORRÉLÉ' : ''));\n\nreturn [{ json: incident }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        400
+      ],
+      "id": "2a11cba6-fd7f-4131-83bd-4d087773154c",
+      "name": "Code_Create_Incident"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "c7877b1a-fded-4c0a-9332-91aeeb8f066f",
+              "leftValue": "={{ $json._skip_db }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -656,
+        400
+      ],
+      "id": "132d16fc-aa9a-48d7-84c8-047d36069a92",
+      "name": "IF_IncidentValide"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "incidents",
+          "mode": "list",
+          "cachedResultName": "incidents"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "severity_score": "={{ $json.severity_score }}",
+            "sla_minutes": "={{ $json.sla_minutes }}",
+            "incident_id": "={{ $json.incident_id }}",
+            "incident_type": "={{ $json.incident_type }}",
+            "source_ip": "={{ $json.source_ip }}",
+            "username": "={{ $json.username }}",
+            "priority": "={{ $json.priority }}",
+            "severity": "={{ $json.severity }}",
+            "mitre_tech": "={{ $json.mitre_tech }}",
+            "mitre_name": "={{ $json.mitre_name }}",
+            "mitre_tactic": "={{ $json.mitre_tactic }}",
+            "audit_trail": "={{ JSON.stringify($json.audit_trail) }}",
+            "status": "={{ $json.status }}",
+            "created_at": "={{ $json.created_at }}",
+            "sla_due": "={{ $json.sla_due }}",
+            "vt_score": 0,
+            "correlated": "={{ $json.correlated }}",
+            "correl_types": "={{ $json.correl_types }}",
+            "vt_verdict": "=UNKNOWN",
+            "risk_score": "={{ $json.risk_score }}",
+            "etat_soar": "={{ $json.etat_soar }}",
+            "etat_siem": "={{ $json.etat_siem }}",
+            "abuse_score": 0
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "incident_id",
+              "displayName": "incident_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "incident_type",
+              "displayName": "incident_type",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_ip",
+              "displayName": "source_ip",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "username",
+              "displayName": "username",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity_score",
+              "displayName": "severity_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tech",
+              "displayName": "mitre_tech",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_name",
+              "displayName": "mitre_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "mitre_tactic",
+              "displayName": "mitre_tactic",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_due",
+              "displayName": "sla_due",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_minutes",
+              "displayName": "sla_minutes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_breached",
+              "displayName": "sla_breached",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "vt_verdict",
+              "displayName": "vt_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_by",
+              "displayName": "decided_by",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_at",
+              "displayName": "decided_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decision",
+              "displayName": "decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_soar",
+              "displayName": "etat_soar",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "closed_at",
+              "displayName": "closed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "audit_trail",
+              "displayName": "audit_trail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "etat_siem",
+              "displayName": "etat_siem",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "correlated",
+              "displayName": "correlated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "correl_types",
+              "displayName": "correl_types",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "vt_score",
+              "displayName": "vt_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "vt_country",
+              "displayName": "vt_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "vt_asn_owner",
+              "displayName": "vt_asn_owner",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "firewall_rule",
+              "displayName": "firewall_rule",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_escalation_sent_at",
+              "displayName": "last_escalation_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "first_alert_at",
+              "displayName": "first_alert_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_score",
+              "displayName": "abuse_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_country",
+              "displayName": "abuse_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_isp",
+              "displayName": "abuse_isp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_verdict",
+              "displayName": "abuse_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -432,
+        288
+      ],
+      "id": "02e8ae73-b409-4354-b6ca-3e99eb6e6fa1",
+      "name": "DB_InsertIncident",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.incident_type }}",
+                    "rightValue": "brute_force",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "dd80b64c-0a72-4084-b127-f3d55d05d9ec"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "7f199370-73b6-4cf3-8a59-d7bca14ef40e",
+                    "leftValue": "={{ $json.incident_type }}",
+                    "rightValue": "phishing",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "fd34cd25-7a88-4e50-8e3b-75570440fbc2",
+                    "leftValue": "={{$json._deduplicated}}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "deduplicated"
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -208,
+        256
+      ],
+      "id": "a147b91a-8ba9-427e-8c19-c016652c0190",
+      "name": "Switch_RoutingPlaybook"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.WEBHOOK_BASE }}/soar-trigger",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-soc-token",
+              "value": "={{ $vars.SOAR_BF_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "incident_type",
+              "value": "={{ $json.incident_type }}"
+            },
+            {
+              "name": "ip",
+              "value": "={{ $json.source_ip }}"
+            },
+            {
+              "name": "etat_siem",
+              "value": "={{ $json.etat_siem }}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "incident_id",
+              "value": "={{ $json.incident_id }}"
+            },
+            {
+              "name": "priority",
+              "value": "={{ $json.priority }}"
+            },
+            {
+              "name": "severity",
+              "value": "={{ $json.severity }}"
+            },
+            {
+              "name": "severity_score",
+              "value": "={{ $json.severity_score }}"
+            },
+            {
+              "name": "mitre_tech",
+              "value": "={{ $json.mitre_tech }}"
+            },
+            {
+              "name": "mitre_name",
+              "value": "={{ $json.mitre_name }}"
+            },
+            {
+              "name": "mitre_tactic",
+              "value": "={{ $json.mitre_tactic }}"
+            },
+            {
+              "name": "session_id",
+              "value": "={{ $json.session_id }}"
+            },
+            {
+              "name": "sla_due",
+              "value": "={{ $json.sla_due }}"
+            },
+            {
+              "name": "sla_minutes",
+              "value": "={{ $json.sla_minutes }}"
+            },
+            {
+              "name": "audit_trail",
+              "value": "={{ JSON.stringify($json.audit_trail) }}"
+            },
+            {
+              "name": "user",
+              "value": "={{ $json.user }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        16,
+        0
+      ],
+      "id": "e82b16cd-46b8-4685-8171-a5855fd017ea",
+      "name": "HTTP_TriggerSOAR_BF",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.WEBHOOK_BASE }}/soar-phishing-trigger",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-soc-token",
+              "value": "={{ $vars.SOAR_PH_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "incident_type",
+              "value": "phishing"
+            },
+            {
+              "name": "ip",
+              "value": "={{ $json.source_ip }}"
+            },
+            {
+              "name": "user",
+              "value": "={{ $json.user || 'unknown@corp.ma' }}"
+            },
+            {
+              "name": "url",
+              "value": "={{ $json.url || 'http://malicious.example.com' }}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "incident_id",
+              "value": "={{ $json.incident_id }}"
+            },
+            {
+              "name": "priority",
+              "value": "={{ $json.priority }}"
+            },
+            {
+              "name": "severity",
+              "value": "={{ $json.severity }}"
+            },
+            {
+              "name": "severity_score",
+              "value": "={{ $json.severity_score }}"
+            },
+            {
+              "name": "mitre_tech",
+              "value": "={{ $json.mitre_tech }}"
+            },
+            {
+              "name": "mitre_name",
+              "value": "={{ $json.mitre_name }}"
+            },
+            {
+              "name": "mitre_tactic",
+              "value": "={{ $json.mitre_tactic }}"
+            },
+            {
+              "name": "session_id",
+              "value": "={{ $json.session_id }}"
+            },
+            {
+              "name": "sla_due",
+              "value": "={{ $json.sla_due }}"
+            },
+            {
+              "name": "sla_minutes",
+              "value": "={{ $json.sla_minutes }}"
+            },
+            {
+              "name": "audit_trail",
+              "value": "={{ JSON.stringify($json.audit_trail) }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        16,
+        192
+      ],
+      "id": "388b1cf1-0a83-4e5b-a870-9bb1f10c5ef7",
+      "name": "HTTP_TriggerSOAR_Phishing",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "={{ $vars.ANALYST_L1_PHONE }}",
+        "toWhatsapp": true,
+        "message": "=⚠️ INCIDENT TYPE INCONNU   Type reçu : {{ $json.incident_type }}   IP source  : {{ $json.ip }}   Timestamp  : {{ $json.timestamp }}   ---   Intervention manuelle SOC requise.   Vérifier le workflow SIEM source.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        16,
+        576
+      ],
+      "id": "ff76090c-e29e-472a-a469-a4cc82a820f0",
+      "name": "WhatsApp_AlerteTypeInconnu",
+      "credentials": {
+        "twilioApi": {
+          "id": "8H5G9PqkaJfT4Cbg",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        16,
+        384
+      ],
+      "id": "78ca12b7-7c01-450d-8675-e3f7ec8b44ef",
+      "name": "NoOp_IncidentDeduplique"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -432,
+        512
+      ],
+      "id": "54ec0ef8-70a4-4ad8-bd37-eea6d4590a94",
+      "name": "NoOp_SkipDB"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT incident_id FROM dedup_cache\nWHERE dedup_key = '{{ $json.incident_type }}_{{ $json.source_ip }}'\n  AND expires_at > NOW()\nLIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1104,
+        400
+      ],
+      "id": "56cfb5f8-cb95-4f3b-838d-9d5ab7590ceb",
+      "name": "Execute a SQL query",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -208,
+        512
+      ],
+      "id": "7474580d-2049-4605-a221-82363a958218",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        240,
+        0
+      ],
+      "id": "a2525b64-f780-485e-b62a-d7afed012ea9",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        240,
+        192
+      ],
+      "id": "374da109-d283-4d97-95ce-b07dfa77d24b",
+      "name": "Respond to Webhook2"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        240,
+        384
+      ],
+      "id": "103a2689-53eb-42c0-84c2-5ec5ab97e6db",
+      "name": "Respond to Webhook3"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        240,
+        576
+      ],
+      "id": "a3ff99ce-9259-4146-8903-ff9628b816c7",
+      "name": "Respond to Webhook4"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Incident_Receiver": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_Create_Incident": {
+      "main": [
+        [
+          {
+            "node": "IF_IncidentValide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF_IncidentValide": {
+      "main": [
+        [
+          {
+            "node": "DB_InsertIncident",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "NoOp_SkipDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_InsertIncident": {
+      "main": [
+        [
+          {
+            "node": "Switch_RoutingPlaybook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch_RoutingPlaybook": {
+      "main": [
+        [
+          {
+            "node": "HTTP_TriggerSOAR_BF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP_TriggerSOAR_Phishing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "NoOp_IncidentDeduplique",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "WhatsApp_AlerteTypeInconnu",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Code_Create_Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NoOp_SkipDB": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP_TriggerSOAR_BF": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP_TriggerSOAR_Phishing": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NoOp_IncidentDeduplique": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp_AlerteTypeInconnu": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "b16554cb-b515-4d2b-a706-a65be4f8d0e9",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "7e20f16afa1f2ac92a7e3b7a480575dcdbea5aadb4b0260e8293755288b187b4"
+  },
+  "nodeGroups": [],
+  "id": "PZSR5HGV3Xa0tMHS",
+  "tags": []
+}

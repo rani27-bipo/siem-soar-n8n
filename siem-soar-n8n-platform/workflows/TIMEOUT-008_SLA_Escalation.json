@@ -1,0 +1,172 @@
+{
+  "name": "TIMEOUT-008_SLA_Escalation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -624,
+        96
+      ],
+      "id": "d5af49d6-0b97-4927-8f81-56aa7c5af255",
+      "name": "Schedule_CheckSLA"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE incidents\nSET\n  sla_breached              = TRUE,\n  last_escalation_sent_at   = NOW(),\n  audit_trail = LEFT(\n    COALESCE(audit_trail, '')\n    || ' | ' || NOW()::text\n    || ' | SLA_BREACH | AUTO | SLA dépassé',\n  49900\n)dépassé'\nWHERE\n  status NOT IN ('CLOSED', 'ESCALATED', 'DEDUPLICATED')\n  AND sla_due < NOW()\n  AND (\n    sla_breached = FALSE\n    OR (\n      sla_breached = TRUE\n      AND (\n        last_escalation_sent_at IS NULL\n        OR last_escalation_sent_at < NOW() - INTERVAL '30 minutes'\n      )\n    )\n  )\nRETURNING\n  incident_id,\n  incident_type,\n  source_ip,\n  priority,\n  sla_due,\n  sla_minutes,\n  ROUND(EXTRACT(EPOCH FROM (NOW() - created_at))/60) AS age_minutes,\n  'SLA_BREACHED' AS status;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -416,
+        96
+      ],
+      "id": "8fb69ba4-34dd-414a-aa33-bc569aff7b88",
+      "name": "DB_DetectSLABreach",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a28cd552-d05d-40fc-b4fc-70329103720d",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "SLA_BREACHED",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -208,
+        96
+      ],
+      "id": "6c6f99c9-8545-466d-a85d-0ecae061e6f7",
+      "name": "IF_SLABreached"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "={{ $vars.ANALYST_L2_PHONE }}",
+        "toWhatsapp": true,
+        "message": "=⚠️ SLA BREACH — {{ $json.incident_id }}\n━━━━━━━━━━━━━━━━━━━━━━━━\n🔴 Priorité  : {{ $json.priority }}\n📍 IP        : {{ $json.source_ip }}\n📋 Type      : {{ $json.incident_type }}\n⏰ Âge       : {{ $json.age_minutes }} min (SLA: {{ $json.sla_minutes }} min)\n━━━━━━━━━━━━━━━━━━━━━━━━\n→ ESCALADE SOC L2 AUTOMATIQUE\n→ Aucune réponse L1 reçue dans les délais\n→ Prochaine notification dans 30 min si non traité",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "57d6ec24-0678-4076-b87c-4342a36f0452",
+      "name": "WhatsApp_EscaladeL2",
+      "credentials": {
+        "twilioApi": {
+          "id": "8H5G9PqkaJfT4Cbg",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ],
+      "id": "90f5dfa6-67d6-40ac-b31a-0f36d86e593e",
+      "name": "NoOp_SLAOk"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule_CheckSLA": {
+      "main": [
+        [
+          {
+            "node": "DB_DetectSLABreach",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_DetectSLABreach": {
+      "main": [
+        [
+          {
+            "node": "IF_SLABreached",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF_SLABreached": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp_EscaladeL2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "NoOp_SLAOk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "84a614b4-d140-4ed3-82e4-f3d7fb205174",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "7e20f16afa1f2ac92a7e3b7a480575dcdbea5aadb4b0260e8293755288b187b4"
+  },
+  "nodeGroups": [],
+  "id": "dwZKcB2NUilXdezl",
+  "tags": []
+}

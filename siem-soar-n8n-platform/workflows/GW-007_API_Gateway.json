@@ -1,0 +1,182 @@
+{
+  "name": "GW-007_API_Gateway",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gateway",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -672,
+        96
+      ],
+      "id": "0ee5d0f0-ae87-4d1a-a64d-6f5989fbd2dd",
+      "name": "APIEntryPoint",
+      "webhookId": "8d525822-9871-4cf1-942d-bdeec90b32ff"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// GW-007 — API Gateway\n// VERSION CORRIGÉE — CVF-001 + CVF-004 + CVF-006\n// ============================================================\n// ── CVF-001 : TOKEN DÉDIÉ GATEWAY ────────────────────────\nconst store = $getWorkflowStaticData('global');\nconst now   = Date.now();\nconst ts    = new Date().toISOString();\nconst raw   = $input.first().json;\nconst body  = raw.body || raw;\n\nconst SOC_TOKEN = String($vars.GATEWAY_TOKEN || '').trim();\nif (!SOC_TOKEN) {\n  return [{ json: { error: 'GATEWAY_MISCONFIGURATION',\n    message: 'GATEWAY_TOKEN non configuré', timestamp: ts, gateway: true } }];\n}\n\n// ── TOKEN — lecture headers + body + raw ──────────────────\nconst receivedToken = String(\n  (raw.headers && raw.headers['x-soc-token']) ||\n  (raw.headers && raw.headers['X-Soc-Token']) ||\n  raw['x-soc-token'] ||\n  raw.soc_token      ||\n  body['x-soc-token'] ||\n  body.soc_token     || ''\n).trim();\n\nif (!receivedToken) {\n  return [{ json: { error: 'UNAUTHORIZED',\n    message: 'Token manquant', gateway: true, timestamp: ts } }];\n}\nif (receivedToken !== SOC_TOKEN) {\n  return [{ json: { error: 'UNAUTHORIZED',\n    message: 'Token invalide', gateway: true, timestamp: ts } }];\n}\n// ── CVF-006 : SLIDING WINDOW RATE-LIMITING ───────────────\nconst clientIP = String(\n  body.ip || body.source_ip || raw.ip || 'unknown'\n).split(',')[0].trim();\nconst safeIP = clientIP.replace(/[.:]/g, '_').substring(0, 50);\nconst rlKey  = 'GW_RL_' + safeIP;\n\nlet rl = { timestamps: [] };\ntry { rl = JSON.parse(store[rlKey] || '{}'); } catch(e) {}\n\nconst WINDOW_MS = 60000;\nconst MAX_REQS  = 100;\nconst cutoff    = now - WINDOW_MS;\nrl.timestamps   = (rl.timestamps || []).filter(t => t > cutoff);\n\nif (rl.timestamps.length >= MAX_REQS) {\n  const retryAfter = Math.ceil((rl.timestamps[0] + WINDOW_MS - now) / 1000);\n  return [{ json: {\n    error      : 'RATE_LIMITED',\n    message    : 'Limite: ' + MAX_REQS + ' req/min',\n    retry_after: retryAfter + 's',\n    gateway    : true, timestamp: ts\n  }}];\n}\nrl.timestamps.push(now);\nstore[rlKey] = JSON.stringify(rl);\n\n// ── CIRCUIT BREAKER ───────────────────────────────────────\nconst requestedRoute = String(\n  body.route || body.target || raw.route || ''\n).toLowerCase().trim();\nconst cbKey = 'GW_CB_' + requestedRoute;\nlet cb = {};\ntry { cb = JSON.parse(store[cbKey] || '{}'); } catch(e) {}\n\nif (cb.open && (now - cb.opened_at) < 120000) {\n  return [{ json: {\n    error    : 'CIRCUIT_OPEN',\n    message  : 'Route ' + requestedRoute + ' temporairement indisponible',\n    retry_in : Math.ceil((120000 - (now - cb.opened_at)) / 1000) + 's',\n    gateway  : true, timestamp: ts\n  }}];\n}\n\n// ── CVF-004 : ROUTING DEPUIS $vars (plus de hardcoding) ──\nconst BASE = String($vars.WEBHOOK_BASE || '').trim();\n\n// Le gateway forward le token du workflow CIBLE, pas le sien\nconst ROUTES = {\n  'siem'    : { target: 'siem-logs',            token: $vars.SIEM_TOKEN    },\n  'dispatch': { target: 'soar-dispatch',         token: $vars.ORCH_TOKEN     },\n  'bf'      : { target: 'soar-trigger',          token: $vars.SOAR_BF_TOKEN  },\n  'phishing': { target: 'soar-phishing-trigger', token: $vars.SOAR_PH_TOKEN  },\n  'sim'     : { target: 'sim-simulator',         token: $vars.SIM_TOKEN      },\n  'report'  : { target: 'report',               token: $vars.REPORT_TOKEN   }\n};\n\nif (!requestedRoute || !ROUTES[requestedRoute]) {\n  return [{ json: {\n    error       : 'INVALID_ROUTE',\n    message     : 'Route inconnue: ' + requestedRoute,\n    valid_routes: Object.keys(ROUTES),\n    gateway     : true, timestamp: ts\n  }}];\n}\n\nconst route     = ROUTES[requestedRoute];\nconst requestId = 'GW-' + now + '-' +\n  Math.random().toString(36).substr(2, 6).toUpperCase();\n\n// ── AUDIT LOG ─────────────────────────────────────────────\nconst SENSITIVE_KEYS = [\n  'soc_token','x-soc-token','token','authorization','password','secret'\n];\nconst auditEntry = {\n  gateway_ts   : ts,\n  request_id   : requestId,\n  route        : requestedRoute,\n  target       : route.target,\n  client_ip    : clientIP,\n  payload_keys : Object.keys(body)\n    .filter(k => !SENSITIVE_KEYS.includes(k.toLowerCase()))\n    .join(',').substring(0, 200)\n};\nconst auditLog = store['GW_AUDIT_LOG']\n  ? JSON.parse(store['GW_AUDIT_LOG']) : [];\nauditLog.push(auditEntry);\nif (auditLog.length > 500) auditLog.splice(0, auditLog.length - 500);\nstore['GW_AUDIT_LOG'] = JSON.stringify(auditLog);\n\n// ── PAYLOAD PROPRE + INJECTION TOKEN CIBLE ───────────────\nconst cleanBody = {};\nObject.keys(body).forEach(k => {\n  if (!SENSITIVE_KEYS.includes(k.toLowerCase())) {\n    cleanBody[k] = body[k];\n  }\n});\n\nconsole.log('[GW-007] ROUTED: ' + requestedRoute +\n  ' → ' + route.target +\n  ' — IP: ' + clientIP + ' — ReqID: ' + requestId);\n\nreturn [{ json: {\n  ...cleanBody,\n  'x-soc-token'  : String(route.token || ''),\n  _gateway       : true,\n  _gateway_ts    : ts,\n  _gateway_route : requestedRoute,\n  _gateway_target: route.target,\n  _gateway_client: clientIP,\n  _request_id    : requestId,\n  target_url     : BASE + '/' + route.target\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        96
+      ],
+      "id": "92525b8e-9ab4-45bf-9d44-3b1bba4b5e55",
+      "name": "Code_AuthRateLimitRoute"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "024d8f3b-e444-44bd-83de-ae4754cdbd9c",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -224,
+        96
+      ],
+      "id": "61d075b6-3483-4905-939d-1304b610aed6",
+      "name": "IF_RequestValide"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.target_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        0,
+        0
+      ],
+      "id": "f45d207a-b74d-4ef5-945c-3b82a4fb2939",
+      "name": "HTTP_ForwardToTarget",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ],
+      "id": "1d89ade7-8f8c-4cf1-a723-500cd233351e",
+      "name": "NoOp_RequestRejected"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// GW-007 — Code_CircuitBreakerFeedback — VERSION FINALE\n// Distingue erreurs backend réelles vs erreurs auth légitimes\n// ============================================================\n\nconst store = $getWorkflowStaticData('global');\nconst input = $input.first().json;\nconst now   = Date.now();\nconst ts    = new Date().toISOString();\n\nconst route  = input._gateway_route || 'unknown';\nconst cbKey  = 'GW_CB_' + route;\nconst errKey = 'GW_ERR_' + route;\n\n// Ne pas compter comme erreur circuit les erreurs d'authentification\n// (UNAUTHORIZED, RATE_LIMITED) — ce sont des réponses applicatives valides\nconst AUTH_ERRORS = ['UNAUTHORIZED', 'RATE_LIMITED', 'INVALID_ROUTE', 'CIRCUIT_OPEN'];\nconst errorCode   = String(input.error || '');\nconst isAuthError = AUTH_ERRORS.includes(errorCode);\n\n// Erreur réelle = erreur HTTP 5xx ou ERROR sans code d'auth connu\nconst isRealError = (\n  !isAuthError &&\n  (\n    input.status === 'ERROR' ||\n    (input.statusCode && input.statusCode >= 500) ||\n    (input.error && !isAuthError)\n  )\n);\n\nlet cb  = {};\nlet err = { timestamps: [] };\ntry { cb  = JSON.parse(store[cbKey]  || '{}'); } catch(e) {}\ntry { err = JSON.parse(store[errKey] || '{}'); } catch(e) {}\n\nif (isRealError) {\n  err.timestamps = (err.timestamps || []).filter(t => t > now - 120000);\n  err.timestamps.push(now);\n  store[errKey] = JSON.stringify(err);\n\n  const ERROR_THRESHOLD = 5;\n  if (err.timestamps.length >= ERROR_THRESHOLD) {\n    cb = { open: true, opened_at: now, route, error_count: err.timestamps.length };\n    store[cbKey] = JSON.stringify(cb);\n    console.log('[GW-007][CB] Circuit OUVERT — route: ' + route +\n      ' — ' + err.timestamps.length + ' erreurs réelles en 2min');\n  } else {\n    console.log('[GW-007][CB] Erreur réelle ' + err.timestamps.length +\n      '/5 — route: ' + route + ' — code: ' + errorCode);\n  }\n} else {\n  if (err.timestamps && err.timestamps.length > 0) {\n    store[errKey] = JSON.stringify({ timestamps: [] });\n  }\n  if (cb.open) {\n    cb = { open: false, closed_at: now };\n    store[cbKey] = JSON.stringify(cb);\n    console.log('[GW-007][CB] Circuit FERMÉ — route: ' + route);\n  }\n}\n\nreturn [{ json: {\n  ...input,\n  _cb_checked   : true,\n  _is_real_error: isRealError,\n  _is_auth_error: isAuthError\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "id": "fc14ee11-449a-4322-a56a-a987757616c6",
+      "name": "Code_CircuitBreakerFeedback"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "APIEntryPoint": {
+      "main": [
+        [
+          {
+            "node": "Code_AuthRateLimitRoute",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_AuthRateLimitRoute": {
+      "main": [
+        [
+          {
+            "node": "IF_RequestValide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF_RequestValide": {
+      "main": [
+        [
+          {
+            "node": "HTTP_ForwardToTarget",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "NoOp_RequestRejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP_ForwardToTarget": {
+      "main": [
+        [
+          {
+            "node": "Code_CircuitBreakerFeedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "b12da10a-cadf-456c-b89a-f4714f9cc8c7",
+  "meta": {
+    "instanceId": "7e20f16afa1f2ac92a7e3b7a480575dcdbea5aadb4b0260e8293755288b187b4"
+  },
+  "nodeGroups": [],
+  "id": "FGVqqk38G5RiAuIJ",
+  "tags": []
+}
