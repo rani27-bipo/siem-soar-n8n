@@ -282,6 +282,16 @@ Ouvre `dashboard/soc_dashboard.html` dans un navigateur. Configure l'URL de ton 
 
 ---
 
+## Pourquoi ces choix d'architecture
+
+**FSM plutôt qu'un simple compteur de seuil** — Un compteur classique (`if failed_attempts > 5`) ne distingue pas une attaque en cours d'une activité terminée, et ne peut pas représenter d'états intermédiaires de surveillance progressive. La FSM permet de modéliser explicitement le passage de l'observation passive (q1, q2) à l'alerte active (q3, q4), avec un reset automatique en cas de succès d'authentification — ce qui réduit les faux positifs sur les utilisateurs qui se trompent simplement de mot de passe une ou deux fois.
+
+**OTP plutôt qu'une simple confirmation par bouton** — Un simple lien "Confirmer" cliquable est vulnérable au phishing et ne garantit pas que c'est bien l'analyste assigné qui valide la décision. Le challenge OTP envoyé sur le téléphone de l'analyste, généré avec un CSPRNG côté serveur (Web Crypto API), garantit que la décision de containment provient d'une personne en possession physique du device enregistré, avec une fenêtre de validité de 5 minutes pour limiter le risque de réutilisation.
+
+**Cache TI plutôt qu'un appel API à chaque incident** — VirusTotal et AbuseIPDB ont des quotas gratuits limités (500 et 1000 requêtes/jour). Sans cache, une même IP attaquante revenant plusieurs fois dans la journée épuiserait rapidement le quota et bloquerait l'enrichissement pour les vrais nouveaux incidents. Le cache à 6h équilibre fraîcheur de la donnée et consommation de quota.
+
+**Corrélation persistante en base plutôt qu'en mémoire n8n** — Le StaticData de n8n est volatile et disparaît lors d'un redémarrage de l'instance ou d'une réactivation de workflow. Stocker la corrélation APT dans la table `correlation_cache` plutôt qu'en StaticData garantit que l'historique de corrélation survit aux redémarrages d'instance et aux déploiements, ce qui est critique pour détecter des patterns d'attaque étalés sur plusieurs heures.
+
 ## Ce que j'ai appris
 
 - Concevoir une **architecture événementielle SOC** avec séparation des responsabilités (detection / orchestration / response / reporting)
