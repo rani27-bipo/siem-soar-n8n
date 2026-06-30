@@ -282,6 +282,22 @@ Ouvre `dashboard/soc_dashboard.html` dans un navigateur. Configure l'URL de ton 
 
 ---
 
+## Automate fini de détection (SIEM-001)
+
+Le moteur de détection repose sur un automate fini à 5 états, persisté en base (table `fsm_states`) pour survivre aux redémarrages de l'instance n8n.
+
+![Automate fini SIEM-001](images/fsm_siem001_automate.png)
+
+| État | Sévérité | Priorité | Déclenche une alerte |
+|------|----------|----------|------------------------|
+| q0 — Repos | INFO | P4 | Non |
+| q1 — Suspicion | LOW | P3 | Non |
+| q2 — Reconnaissance | MEDIUM | P2 | Non |
+| q3 — Menace active | HIGH | P1 | Oui (une fois, via flag `alertSent`) |
+| q4 — Compromission critique | CRITICAL | P0 | Oui (une fois par nouvel événement) |
+
+Tout événement `timeout` ou `resolved` ramène l'automate à `q0` et réinitialise le compteur, quel que soit l'état courant — ce qui évite qu'un incident résolu reste indéfiniment marqué comme actif.
+
 ## Pourquoi ces choix d'architecture
 
 **FSM plutôt qu'un simple compteur de seuil** — Un compteur classique (`if failed_attempts > 5`) ne distingue pas une attaque en cours d'une activité terminée, et ne peut pas représenter d'états intermédiaires de surveillance progressive. La FSM permet de modéliser explicitement le passage de l'observation passive (q1, q2) à l'alerte active (q3, q4), avec un reset automatique en cas de succès d'authentification — ce qui réduit les faux positifs sur les utilisateurs qui se trompent simplement de mot de passe une ou deux fois.
