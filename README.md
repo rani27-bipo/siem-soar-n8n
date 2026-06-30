@@ -61,6 +61,43 @@ graph TD
 
 ---
 
+## Automates finis et logique d'état
+
+Le projet contient **un seul automate fini formel** (SIEM-001) et **deux pipelines de cycle de vie** (SOAR-002, SOAR-003) qui réutilisent une notation similaire (`q1`, `q2`...) sans en être mathématiquement — distinction volontairement explicitée ci-dessous pour rester rigoureux.
+
+### SIEM-001 — Automate fini de détection brute force
+
+Véritable FSM à 5 états, persistée en base (table `fsm_sessions`) pour survivre aux redémarrages de l'instance n8n. Table de transition δ(état, événement) → état, alphabet fixe `{auth_fail, port_scan, priv_escalation, phishing, data_exfil, timeout, resolved}`, états accepteurs `q3` et `q4`.
+
+![Automate fini SIEM-001](images/fsm_siem001_automate.png)
+
+| État | Sévérité | Priorité | Déclenche une alerte |
+|------|----------|----------|------------------------|
+| `q0` — Repos | INFO | P4 | Non |
+| `q1` — Suspicion | LOW | P3 | Non |
+| `q2` — Reconnaissance | MEDIUM | P2 | Non |
+| `q3` — Menace active | HIGH | P1 | Oui (une fois, via flag `alertSent`) |
+| `q4` — Compromission critique | CRITICAL | P0 | Oui (réarmée à chaque nouvel événement grave) |
+
+Tout événement `timeout` ou `resolved` ramène l'automate à `q0` et réinitialise le compteur, quel que soit l'état courant — ce qui évite qu'un incident résolu reste indéfiniment marqué comme actif et limite les faux positifs sur des erreurs de saisie ponctuelles.
+
+### SOAR-002 / SOAR-003 — Cycle de vie de l'incident (pas une FSM)
+
+Une fois l'alerte transmise par SIEM-001, les playbooks SOAR-002 et SOAR-003 font progresser l'incident à travers un **pipeline séquentiel de statuts** (champ `etat_soar`). Contrairement à SIEM-001, il n'existe ici aucune table de transition générale : chaque nœud `Code_*` du workflow écrit la valeur suivante en dur, sans jamais relire l'état précédent pour décider de la transition. C'est un suivi de cycle de vie, pas un automate.
+
+![Cycle de vie incident SOAR-002](images/soar002_incident_lifecycle.png)
+
+| Étape | Signification |
+|-------|----------------|
+| `q1_Triage` | Incident créé, en attente d'enrichissement |
+| `q2_Enrichissement` | Enrichi avec succès via VirusTotal + AbuseIPDB |
+| `q2_Enrichissement_Partiel` | Enrichissement partiel suite à un échec API |
+| `q4_Containment` | Décision analyste OUI reçue, action de containment exécutée |
+| `q5_Escalation` | Timeout SLA ou échec de containment — escaladé en L2 |
+| `q6_Closed` | Incident clôturé (containment réussi ou décision NON de l'analyste) |
+
+---
+
 ## Mapping MITRE ATT&CK
 
 | Technique | Nom | Tactic | Workflow |
@@ -104,7 +141,7 @@ Le schéma complet avec index partiels, triggers, fonctions de purge et RLS est 
 
 | Catégorie | Technologie |
 |-----------|-------------|
-| Orchestration SOAR | n8n Cloud (9 workflows, 109 nœuds) |
+| Orchestration SOAR | n8n Cloud (10 workflows) |
 | Base de données | PostgreSQL via Supabase (7 tables, RLS, index partiels) |
 | Alerting analyste | Twilio WhatsApp + SMS |
 | Threat Intelligence | VirusTotal API + AbuseIPDB |
@@ -114,56 +151,39 @@ Le schéma complet avec index partiels, triggers, fonctions de purge et RLS est 
 
 ---
 
-## Structure du projet:
+## Structure du projet
 siem-soar-n8n/
-
 ├── README.md
-
 ├── .env.example                          # variables d'environnement — modèle
-
 ├── .gitignore
-
 ├── workflows/                            # 10 workflows n8n exportés en JSON
-
 │   ├── GW-007_API_Gateway.json
-
 │   ├── SIEM-001_BruteForce_Detector.json
-
 │   ├── ORCH-000_Incident_Dispatcher.json
-
 │   ├── SOAR-002_BruteForce_Response.json
-
 │   ├── SOAR-003_Phishing_Response.json
-
 │   ├── RESP-006_Response_Dispatcher.json
-
 │   ├── RELAY-010_Twilio_HMAC_Validator.json
-
 │   ├── REPORT-005_Metrics_Dashboard.json
-
 │   ├── SIM-004_Firewall_Simulator.json
-
 │   └── TIMEOUT-008_SLA_Escalation.json
-
 ├── database/
-
 │   ├── schema.sql                        # schéma complet Supabase — à exécuter dans SQL Editor
-
 │   └── edge-functions/
-
-│       └── generate-otp.ts              # Edge Function Deno — génération OTP cryptographique
-
+│       └── generate-otp.ts               # Edge Function Deno — génération OTP cryptographique
 ├── dashboard/
-
-│   └── soc_dashboard.html               # dashboard SOC — métriques temps réel
-
+│   └── soc_dashboard.html                # dashboard SOC — métriques temps réel
+├── images/
+│   ├── n8n-workflows.png
+│   ├── database.png
+│   ├── soc_dashboard.png
+│   ├── SOAR_002_workflow.png
+│   ├── fsm_siem001_automate.png
+│   └── soar002_incident_lifecycle.png
 ├── docs/
-
-│   └── incident_response_playbook.md    # playbooks brute force et phishing
-
+│   └── incident_response_playbook.md     # playbooks brute force et phishing
 └── test/
-
-└── soc_test_suite.py                # suite de tests Python — 50+ assertions
+└── soc_test_suite.py                 # suite de tests Python — 50+ assertions
 
 ---
 
@@ -282,22 +302,6 @@ Ouvre `dashboard/soc_dashboard.html` dans un navigateur. Configure l'URL de ton 
 
 ---
 
-## Automate fini de détection (SIEM-001)
-
-Le moteur de détection repose sur un automate fini à 5 états, persisté en base (table `fsm_states`) pour survivre aux redémarrages de l'instance n8n.
-
-![Automate fini SIEM-001](images/fsm_siem001_automate.png)
-
-| État | Sévérité | Priorité | Déclenche une alerte |
-|------|----------|----------|------------------------|
-| q0 — Repos | INFO | P4 | Non |
-| q1 — Suspicion | LOW | P3 | Non |
-| q2 — Reconnaissance | MEDIUM | P2 | Non |
-| q3 — Menace active | HIGH | P1 | Oui (une fois, via flag `alertSent`) |
-| q4 — Compromission critique | CRITICAL | P0 | Oui (une fois par nouvel événement) |
-
-Tout événement `timeout` ou `resolved` ramène l'automate à `q0` et réinitialise le compteur, quel que soit l'état courant — ce qui évite qu'un incident résolu reste indéfiniment marqué comme actif.
-
 ## Pourquoi ces choix d'architecture
 
 **FSM plutôt qu'un simple compteur de seuil** — Un compteur classique (`if failed_attempts > 5`) ne distingue pas une attaque en cours d'une activité terminée, et ne peut pas représenter d'états intermédiaires de surveillance progressive. La FSM permet de modéliser explicitement le passage de l'observation passive (q1, q2) à l'alerte active (q3, q4), avec un reset automatique en cas de succès d'authentification — ce qui réduit les faux positifs sur les utilisateurs qui se trompent simplement de mot de passe une ou deux fois.
@@ -308,10 +312,14 @@ Tout événement `timeout` ou `resolved` ramène l'automate à `q0` et réinitia
 
 **Corrélation persistante en base plutôt qu'en mémoire n8n** — Le StaticData de n8n est volatile et disparaît lors d'un redémarrage de l'instance ou d'une réactivation de workflow. Stocker la corrélation APT dans la table `correlation_cache` plutôt qu'en StaticData garantit que l'historique de corrélation survit aux redémarrages d'instance et aux déploiements, ce qui est critique pour détecter des patterns d'attaque étalés sur plusieurs heures.
 
+**Pipeline de statuts plutôt qu'une seconde FSM pour SOAR-002/003** — Contrairement à la détection brute force où le nombre d'états et de transitions possibles justifie une vraie table de transition, le déroulement d'un playbook de réponse est intrinsèquement linéaire (triage → enrichissement → décision → containment/escalade → clôture). Modéliser ça comme une FSM aurait ajouté de la complexité sans bénéfice : un simple champ de statut écrit séquentiellement suffit et reste plus lisible pour le débogage.
+
+---
+
 ## Ce que j'ai appris
 
 - Concevoir une **architecture événementielle SOC** avec séparation des responsabilités (detection / orchestration / response / reporting)
-- Implémenter un **automate fini (FSM)** pour la détection stateful de brute force avec persistance en base
+- Implémenter un **automate fini (FSM)** pour la détection stateful de brute force avec persistance en base, et savoir reconnaître quand un pipeline séquentiel suffit plutôt qu'une FSM complète
 - Sécuriser les appels inter-services avec **HMAC-SHA1** et authentification par token Bearer
 - Construire un **flux de validation OTP multi-facteur** pour les décisions critiques d'analystes SOC
 - Intégrer des **APIs de Threat Intelligence** (VirusTotal, AbuseIPDB) avec cache pour optimiser les quotas
