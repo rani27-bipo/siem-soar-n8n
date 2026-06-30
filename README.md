@@ -153,37 +153,67 @@ Le schéma complet avec index partiels, triggers, fonctions de purge et RLS est 
 
 ## Structure du projet
 siem-soar-n8n/
+
 ├── README.md
 
 ├── .env.example                          # variables d'environnement — modèle
+
 ├── .gitignore
+
 ├── workflows/                            # 10 workflows n8n exportés en JSON
+
 │   ├── GW-007_API_Gateway.json
+
 │   ├── SIEM-001_BruteForce_Detector.json
+
 │   ├── ORCH-000_Incident_Dispatcher.json
+
 │   ├── SOAR-002_BruteForce_Response.json
+
 │   ├── SOAR-003_Phishing_Response.json
+
 │   ├── RESP-006_Response_Dispatcher.json
+
 │   ├── RELAY-010_Twilio_HMAC_Validator.json
+
 │   ├── REPORT-005_Metrics_Dashboard.json
+
 │   ├── SIM-004_Firewall_Simulator.json
+
 │   └── TIMEOUT-008_SLA_Escalation.json
+
 ├── database/
+
 │   ├── schema.sql                        # schéma complet Supabase — à exécuter dans SQL Editor
+
 │   └── edge-functions/
+
 │       └── generate-otp.ts               # Edge Function Deno — génération OTP cryptographique
+
 ├── dashboard/
+
 │   └── soc_dashboard.html                # dashboard SOC — métriques temps réel
+
 ├── images/
+
 │   ├── n8n-workflows.png
+
 │   ├── database.png
+
 │   ├── soc_dashboard.png
+
 │   ├── SOAR_002_workflow.png
+
 │   ├── fsm_siem001_automate.png
+
 │   └── soar002_incident_lifecycle.png
+
 ├── docs/
+
 │   └── incident_response_playbook.md     # playbooks brute force et phishing
+
 └── test/
+
 └── soc_test_suite.py                 # suite de tests Python — 50+ assertions
 
 ---
