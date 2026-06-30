@@ -1,0 +1,2236 @@
+{
+  "name": "SOAR-002_BruteForce_Response_FIXED",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Code_Triage_Incident\n// VERSION CORRIGÉE FINALE — headers token fix\n// ============================================================\n\nconst SOC_TOKEN = String($vars.SOAR_BF_TOKEN || '').trim();\nif (!SOC_TOKEN) {\n  return [{ json: { error: 'MISCONFIGURATION',\n    message: 'SOAR_BF_TOKEN manquant en configuration n8n' } }];\n}\n\nconst raw   = $input.first().json;\nconst input = raw.body || raw;\nconst now   = new Date().toISOString();\n\n// ── TOKEN — lecture headers HTTP EN PRIORITÉ ──────────────\nconst receivedToken = String(\n  (raw.headers && raw.headers['x-soc-token']) ||\n  (raw.headers && raw.headers['X-Soc-Token']) ||\n  raw['x-soc-token']   ||\n  raw.soc_token        ||\n  input['x-soc-token'] ||\n  input.soc_token      || ''\n).trim();\n\nif (!receivedToken) {\n  return [{ json: { error: 'UNAUTHORIZED',\n    message: 'Token manquant', timestamp: now } }];\n}\nif (receivedToken !== SOC_TOKEN) {\n  console.log('[SECURITY][SOAR-002] WARN: Token invalide — ' + now);\n  return [{ json: { error: 'UNAUTHORIZED',\n    message: 'Token SOC invalide — SOAR-002', timestamp: now } }];\n}\n\nfunction sanitizeForLog(val) {\n  return String(val).replace(/[|\\n\\r\\t]/g, '_').substring(0, 100);\n}\nfunction normalizeIP(raw_ip) {\n  const s = String(raw_ip || '').trim().toLowerCase();\n  if (s.startsWith('::ffff:')) return s.slice(7);\n  if (/^(\\d{1,3}\\.){3}\\d{1,3}$/.test(s)) {\n    const octets = s.split('.').map(Number);\n    if (octets.some(o => isNaN(o) || o < 0 || o > 255)) return null;\n    return octets.join('.');\n  }\n  if (/^[0-9a-f:]{3,39}$/.test(s)) return s;\n  return null;\n}\n\nconst rawIP    = input.source_ip || input.ip || '';\nconst sourceIP = normalizeIP(rawIP);\nif (!sourceIP) {\n  return [{ json: { error: 'INVALID_IP',\n    message: 'Format IP invalide: ' + sanitizeForLog(rawIP),\n    timestamp: now } }];\n}\n\nconst PROTECTED_IPS = ['0.0.0.0','127.0.0.1','::1','10.0.0.1','localhost'];\nif (PROTECTED_IPS.includes(sourceIP)) {\n  return [{ json: { error: 'PROTECTED_IP',\n    message: 'Triage refusé — IP protégée: ' + sourceIP,\n    timestamp: now } }];\n}\n\nconst incId    = sanitizeForLog(input.incident_id || 'INC-BF-' + Date.now());\nconst username = sanitizeForLog(input.username || input.user || 'unknown');\n\nconst incident = {\n  incident_id   : incId,\n  incident_type : 'brute_force',\n  source_ip     : sourceIP,\n  username,\n  mitre_tech    : sanitizeForLog(input.mitre_tech    || 'T1110'),\n  mitre_name    : sanitizeForLog(input.mitre_name    || 'Brute Force'),\n  mitre_tactic  : sanitizeForLog(input.mitre_tactic  || 'Credential Access'),\n  severity      : sanitizeForLog(input.severity      || 'HIGH'),\n  severity_score: Number(input.severity_score || 75),\n  priority      : sanitizeForLog(input.priority      || 'P1'),\n  sla_due       : sanitizeForLog(input.sla_due       || now),\n  sla_minutes   : Number(input.sla_minutes           || 60),\n  etat_siem     : sanitizeForLog(input.etat_siem     || 'q3'),\n  etat_soar     : 'q1_Triage',\n  timestamp     : sanitizeForLog(input.timestamp     || now),\n  status        : 'TRIAGE',\n  created_at    : now,\n  audit_trail   : [\n    now + ' | TRIAGE | SOC_AUTO | Alerte reçue — IP: ' +\n    sanitizeForLog(sourceIP) + ' — Priority: ' +\n    sanitizeForLog(input.priority || 'P1')\n  ]\n};\n\nconst store = $getWorkflowStaticData('global');\nstore['LAST_INCIDENT'] = incId;\nstore[incId]           = JSON.stringify(incident);\n\nreturn [{ json: incident }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        96
+      ],
+      "id": "fc14d18b-ea50-4c84-a1cc-7bc854821f00",
+      "name": "Code_Triage_Incident"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "={{ $vars.ANALYST_L1_PHONE }}",
+        "toWhatsapp": true,
+        "message": "={{ $json.whatsapp_message }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        2448,
+        0
+      ],
+      "id": "dd92a1a8-c56c-41b9-b7d6-a3addf64755c",
+      "name": "WhatsApp_Alerte_Analyste",
+      "credentials": {
+        "twilioApi": {
+          "id": "8H5G9PqkaJfT4Cbg",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Code_Traitement_Decision\n// ============================================================\n\nvar raw    = $input.first().json;\nvar body   = raw.body || raw;\nvar nowISO = new Date().toISOString();\n\n// ── PARSE DÉCISION + OTP ──────────────────────────────────\nvar bodyRaw = String(\n  body.Body || body.body || raw.Body || body.decision || ''\n).toUpperCase().trim();\n\nconst OTP_PATTERN = /^(BF)-(OUI|NON)-(\\d{6})$/;\nconst match = bodyRaw.match(OTP_PATTERN);\n\nif (!match) {\n  console.log('[SOAR-002] Format invalide: ' + bodyRaw);\n  return [{ json: {\n    status : 'IGNORED',\n    message: 'Format attendu: BF-OUI-123456 ou BF-NON-123456',\n    received: bodyRaw, timestamp: nowISO\n  }}];\n}\n\nconst [, , decision, otpCode] = match;\n\n// ── VALIDATION EXPÉDITEUR ──────────────────────────────────\nvar sender = String(\n  body.From || body.from || raw.From || raw.from || ''\n).replace('whatsapp:', '').trim();\n\nif (!sender) {\n  return [{ json: { error: 'MISSING_SENDER',\n    message: 'Expéditeur non identifié', timestamp: nowISO } }];\n}\n\nvar AUTHORIZED_PHONES = [];\nif ($vars.ANALYST_L1_PHONE)\n  AUTHORIZED_PHONES.push(String($vars.ANALYST_L1_PHONE).trim());\nif ($vars.ANALYST_L2_PHONE)\n  AUTHORIZED_PHONES.push(String($vars.ANALYST_L2_PHONE).trim());\n\nif (AUTHORIZED_PHONES.length === 0) {\n  return [{ json: { error: 'MISCONFIGURATION',\n    message: 'ANALYST_L1_PHONE / ANALYST_L2_PHONE non configurés' } }];\n}\nif (!AUTHORIZED_PHONES.includes(sender)) {\n  console.log('[SECURITY][SOAR-002] Expéditeur non autorisé: ' + sender);\n  return [{ json: { error: 'UNAUTHORIZED',\n    message: 'Expéditeur non autorisé', timestamp: nowISO } }];\n}\n\nvar ANALYST_NAMES = {};\nif ($vars.ANALYST_L1_PHONE)\n  ANALYST_NAMES[String($vars.ANALYST_L1_PHONE).trim()] = 'SOC_L1_Analyst';\nif ($vars.ANALYST_L2_PHONE)\n  ANALYST_NAMES[String($vars.ANALYST_L2_PHONE).trim()] = 'SOC_L2_Lead';\nvar analystName = ANALYST_NAMES[sender] || 'SOC_L1_Analyst';\n\n// ── VALIDATION OTP DEPUIS SUPABASE ────────────────────────\nvar otpRow = null;\ntry {\n  const dbResult = $('DB_ValidateOTP').first()?.json;\n  if (dbResult && dbResult.otp_code) {\n    otpRow = dbResult;\n  }\n} catch(e) {\n  console.log('[SOAR-002] Impossible de lire DB_ValidateOTP: ' + e.message);\n}\n\nif (!otpRow) {\n  console.log('[SECURITY][SOAR-002] OTP invalide ou expiré: ' + otpCode.substring(0,3) + '***');\n  return [{ json: {\n    error    : 'INVALID_OTP',\n    message  : 'OTP invalide, expiré, ou déjà utilisé',\n    timestamp: nowISO\n  }}];\n}\n\nconst incidentId = otpRow.incident_id;\n\n// ── LECTURE INCIDENT DEPUIS STORE (avec fallback DB) ──────\nvar store = $getWorkflowStaticData('global');\nvar incidentData = {};\ntry { incidentData = JSON.parse(store[incidentId] || '{}'); }\ncatch(e) { incidentData = {}; }\n\n// FALLBACK : si le store est vide (restart n8n entre alerte et réponse),\n// on reconstruit les données minimales depuis l'OTP row et les données\n// disponibles dans le contexte courant\nif (!incidentData.incident_id) {\n  console.log('[SOAR-002][WARN] Store vide pour: ' + incidentId +\n    ' — reconstruction depuis contexte OTP');\n  incidentData = {\n    incident_id   : incidentId,\n    source_ip     : String(body.source_ip || raw.source_ip || '0.0.0.0'),\n    username      : String(body.username || raw.username || 'unknown'),\n    mitre_tech    : String(body.mitre_tech || raw.mitre_tech || 'T1110'),\n    mitre_name    : String(body.mitre_name || raw.mitre_name || 'Brute Force'),\n    mitre_tactic  : String(body.mitre_tactic || raw.mitre_tactic || 'Credential Access'),\n    severity      : String(body.severity || raw.severity || 'HIGH'),\n    severity_score: Number(body.severity_score || raw.severity_score || 75),\n    priority      : String(body.priority || raw.priority || 'P1'),\n    sla_minutes   : Number(body.sla_minutes || raw.sla_minutes || 60),\n    audit_trail   : [],\n    created_at    : new Date(Date.now() - 300000).toISOString()\n  };\n}\n\nfunction sanitizeForLog(val) {\n  return String(val).replace(/[|\\n\\r\\t]/g, '_').substring(0, 100);\n}\n\nvar trail = Array.isArray(incidentData.audit_trail)\n  ? incidentData.audit_trail : [];\ntrail.push(\n  nowISO + ' | DECISION | ' + sanitizeForLog(analystName) +\n  ' | Réponse: ' + sanitizeForLog(decision) +\n  ' | OTP: ' + otpCode.substring(0, 3) + '***' +\n  ' | IP: ' + sanitizeForLog(incidentData.source_ip)\n);\n\ndelete store['LAST_INCIDENT'];\n\nreturn [{ json: {\n  incident_id   : incidentData.incident_id,\n  source_ip     : incidentData.source_ip,\n  username      : incidentData.username,\n  mitre_tech    : incidentData.mitre_tech,\n  mitre_name    : incidentData.mitre_name,\n  mitre_tactic  : incidentData.mitre_tactic,\n  severity      : incidentData.severity,\n  severity_score: incidentData.severity_score,\n  priority      : incidentData.priority,\n  sla_minutes   : incidentData.sla_minutes,\n  decided_by    : analystName,\n  decided_at    : nowISO,\n  decision,\n  otp_code      : otpCode,\n  is_approved   : (decision === 'OUI'),\n  audit_trail   : trail\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        896
+      ],
+      "id": "1ab06e2a-d1a2-473a-acc3-a62623e39db1",
+      "name": "Code_Traitement_Decision"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "15735bb3-421e-4944-8a2d-e864dbb27245",
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "OUI",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "ee930238-04bf-4e86-8b80-babafd7a053e",
+              "leftValue": "={{ $json.incident_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        800
+      ],
+      "id": "83c2ac94-3097-41db-9d24-28073992ac1f",
+      "name": "IF_OUI_ou_NON"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Containment approuvé\n// ============================================================\nvar input  = $input.first().json;\nvar now    = new Date().toISOString();\nvar trail  = Array.isArray(input.audit_trail) ? input.audit_trail : [];\ntrail.push(now + ' | CONTAINMENT | ' + (input.decided_by || 'SOC_AUTO') +\n           ' | Blocage IP autorisé — IP: ' + (input.source_ip || 'unknown'));\n\nvar store = $getWorkflowStaticData('global');\nvar key   = input.incident_id;\n\nif (key) {\n  // Sauvegarder l'incident_id pour que Code_Cloture_Incident puisse le retrouver\n  // même après que SIM-004 ait écrasé le contexte $json\n  store['_last_contained_id'] = key;\n\n  if (store[key]) {\n    try {\n      var stored        = JSON.parse(store[key]);\n      stored.status     = 'CONTAINED';\n      stored.etat_soar  = 'q4_Containment';\n      stored.decided_by = input.decided_by;\n      stored.decided_at = now;\n      store[key]        = JSON.stringify(stored);\n    } catch(e) {\n      console.log('[SOAR-002] WARN: Impossible de mettre à jour le store pour ' + key);\n    }\n  }\n}\n\nreturn [{ json: Object.assign({}, input, {\n  status     : 'CONTAINED',\n  etat_soar  : 'q4_Containment',\n  decided_at : now,\n  audit_trail: trail\n}) }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        656
+      ],
+      "id": "cc58f0a7-84c7-45b7-a259-e385b82ffcf1",
+      "name": "Code_Containment"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://rani26.app.n8n.cloud/webhook/sim-simulator",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-soc-token",
+              "value": "={{ $vars.SIM_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "action",
+              "value": "block_ip"
+            },
+            {
+              "name": "ip",
+              "value": "={{ $json.source_ip }}"
+            },
+            {
+              "name": "incident_id",
+              "value": "={{ $json.incident_id }}"
+            },
+            {
+              "name": "reason",
+              "value": "=Brute Force SSH — Approuvé par {{ $json.decided_by }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1568,
+        656
+      ],
+      "id": "628c86ab-194e-4427-a2e6-842cd1e7c6d2",
+      "name": "HTTP_Block_IP_Firewall",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Code_Cloture_Incident\n// VERSION SUPABASE — plus de métriques dans StaticData\n// ============================================================\n\nvar simResponse = $input.first().json;\nvar now         = new Date().toISOString();\nvar rule_id     = simResponse.rule_id || 'RULE_UNKNOWN';\n\nif (simResponse.status !== 'SUCCESS') {\n  console.log('[SOAR-002] WARN: SIM-004 retourne échec: ' + (simResponse.message || 'unknown'));\n  return [{ json: {\n    error       : 'CONTAINMENT_FAILED',\n    message     : 'Simulateur erreur: ' + (simResponse.message || 'unknown'),\n    sim_response: simResponse,\n    timestamp   : now\n  }}];\n}\n\nvar store = $getWorkflowStaticData('global');\n\nvar incidentId = simResponse.incident_id;\nif (!incidentId || incidentId === 'INC-UNKNOWN') {\n  incidentId = store['_last_contained_id'] || null;\n}\n\nvar incidentData = {};\nif (incidentId && store[incidentId]) {\n  try {\n    incidentData = JSON.parse(store[incidentId]);\n  } catch(e) { incidentData = {}; }\n}\n\n// Fallback si incident non trouvé en store (vient de Supabase via ORCH-000)\nif (!incidentData.incident_id) {\n  console.log('[SOAR-002] Store miss pour: ' + incidentId + ' — utilisation données SIM');\n  incidentData = {\n    incident_id   : incidentId  || 'INC-UNKNOWN-' + Date.now(),\n    source_ip     : simResponse.ip_blocked || '0.0.0.0',\n    username      : 'unknown',\n    mitre_tech    : 'T1110',\n    mitre_name    : 'Brute Force',\n    mitre_tactic  : 'Credential Access',\n    severity      : 'HIGH',\n    severity_score: 75,\n    priority      : 'P1',\n    decided_by    : 'SOC_L1_Analyst',\n    audit_trail   : [],\n    created_at    : new Date(Date.now() - 60000).toISOString()\n  };\n}\n\nvar trail = Array.isArray(incidentData.audit_trail) ? incidentData.audit_trail : [];\ntrail.push(now + ' | CLOSED | SOC_AUTO | IP bloquée — Firewall: PaloAlto-NGFW-01 — Rule: ' + rule_id);\n\n// Calcul MTTR pour retourner au node Postgres\nvar mttr_minutes = 0;\nif (incidentData.created_at) {\n  try {\n    mttr_minutes = Math.max(0, (new Date(now).getTime() - new Date(incidentData.created_at).getTime()) / 60000);\n    mttr_minutes = parseFloat(mttr_minutes.toFixed(2));\n  } catch(e) {}\n}\n\n// Nettoyage store (court terme seulement)\nif (incidentData.incident_id && incidentData.incident_id !== 'INC-UNKNOWN') {\n  delete store[incidentData.incident_id];\n}\ndelete store['LAST_INCIDENT'];\ndelete store['_last_contained_id'];\n\nreturn [{ json: Object.assign({}, incidentData, {\n  status        : 'CLOSED',\n  etat_soar     : 'q6_Closed',\n  closed_at     : now,\n  firewall_rule : rule_id,\n  mttr_minutes  : mttr_minutes,\n  audit_trail   : trail\n}) }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        416
+      ],
+      "id": "7c2f28b2-2e62-467b-876f-3edb5cc6fbdc",
+      "name": "Code_Cloture_Incident"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "={{ $vars.ANALYST_L1_PHONE }}",
+        "toWhatsapp": true,
+        "message": "=✅ INCIDENT {{ $json.incident_id }} CLÔTURÉ\n━━━━━━━━━━━━━━━━━━━━━━━━\n🔴 MITRE    : {{ $json.mitre_tech }} — {{ $json.mitre_name }}\n📍 IP       : {{ $json.source_ip }}\n🔥 Firewall : PaloAlto-NGFW-01\n👤 Analyste : {{ $json.decided_by }}\n⏰ Clôturé  : {{ $now.toISO() }}\n🛡️ Statut   : CONTAINED + CLOSED\n━━━━━━━━━━━━━━━━━━━━━━━━\nIncident clôturé avec succès.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        416
+      ],
+      "id": "d2b23579-cabc-4ab2-983b-6eec47e60118",
+      "name": "WhatsApp_Cloture",
+      "credentials": {
+        "twilioApi": {
+          "id": "8H5G9PqkaJfT4Cbg",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Escalade SOC L2\n// ============================================================\nvar input = $input.first().json;\nvar now   = new Date().toISOString();\nvar trail = Array.isArray(input.audit_trail) ? input.audit_trail : [];\ntrail.push(now + ' | ESCALATION | ' + (input.decided_by || 'SOC_L1') +\n           ' | Décision NON — Escalade SOC L2');\n\nvar store = $getWorkflowStaticData('global');\nvar key   = input.incident_id;\n\nif (key && store[key]) {\n  try {\n    var stored       = JSON.parse(store[key]);\n    stored.status    = 'ESCALATED';\n    stored.etat_soar = 'q5_Escalation';\n    store[key]       = JSON.stringify(stored);\n  } catch(e) {}\n}\nstore.human_count = (store.human_count || 0) + 1;\n\n// CORRECTION : construction explicite au lieu de Object.assign\n// évite la pollution de prototype si input contient __proto__\nreturn [{ json: {\n  incident_id   : String(input.incident_id   || ''),\n  source_ip     : String(input.source_ip     || ''),\n  username      : String(input.username      || ''),\n  mitre_tech    : String(input.mitre_tech    || ''),\n  mitre_name    : String(input.mitre_name    || ''),\n  mitre_tactic  : String(input.mitre_tactic  || ''),\n  severity      : String(input.severity      || ''),\n  severity_score: Number(input.severity_score || 0),\n  priority      : String(input.priority      || ''),\n  sla_minutes   : Number(input.sla_minutes   || 0),\n  decided_by    : String(input.decided_by    || ''),\n  decided_at    : String(input.decided_at    || now),\n  decision      : String(input.decision      || ''),\n  vt_verdict    : String(input.vt_verdict    || 'UNKNOWN'),\n  vt_score      : Number(input.vt_score      || 0),\n  status        : 'ESCALATED',\n  etat_soar     : 'q5_Escalation',\n  escalated_at  : now,\n  audit_trail   : trail\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        1024
+      ],
+      "id": "cc2fc28c-ac07-4b01-912c-bb38049fae43",
+      "name": "Code_Escalade_L2"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "={{ $vars.ANALYST_L1_PHONE }}",
+        "toWhatsapp": true,
+        "message": "=⚠️ ESCALADE SOC L2 — {{ $json.incident_id }}\n━━━━━━━━━━━━━━━━━━━━━━━━\n🔴 MITRE    : {{ $json.mitre_tech }}\n📍 IP source: {{ $json.source_ip }}\n👤 User     : {{ $json.username }}\n🎯 Priorité : {{ $json.priority }}\n👮 Analyste : {{ $json.decided_by }} a refusé\n━━━━━━━━━━━━━━━━━━━━━━━━\n→ Intervention SOC L2 requise IMMÉDIATEMENT\n→ SLA restant : {{ $json.sla_minutes }} min",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        1792,
+        1024
+      ],
+      "id": "374ed698-821e-4d85-9bf1-a6cc7a2a6e82",
+      "name": "WhatsApp_Escalade_L2",
+      "credentials": {
+        "twilioApi": {
+          "id": "8H5G9PqkaJfT4Cbg",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://www.virustotal.com/api/v3/ip_addresses/{{ $json.source_ip }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        672,
+        0
+      ],
+      "id": "8835ca59-faa1-41bd-8ab5-e20a09231888",
+      "name": "VT_IP_Lookup",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "02GE2CnftLrzJUjN",
+          "name": "VirusTotal API Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — VT_Enrichissement\n// CORRECTIONS :\n//   1. Fallback complet si VT indisponible / quota / erreur\n//   2. Suppression du fallback fragile $('Code_Triage_Incident')\n//   3. Score VT critique → priorité P0 + flag store mis à jour\n// ============================================================\n\nvar vtResponse = $input.first().json;\nvar now        = new Date().toISOString();\nvar store      = $getWorkflowStaticData('global');\nvar lastId     = store['LAST_INCIDENT'];\n\n// ── LECTURE INCIDENT DEPUIS STORE ─────────────────────────\nvar incident = {};\nif (lastId) {\n  try { incident = JSON.parse(store[lastId] || '{}'); } catch(e) { incident = {}; }\n}\n\nif (!incident.incident_id) {\n  console.log('[SOAR-002] WARN: VT_Enrichissement — incident introuvable en store pour ID: ' + lastId);\n  incident = { incident_id: 'UNKNOWN', audit_trail: [], priority: 'P1', severity: 'HIGH', severity_score: 75 };\n}\n\n// ── DÉTECTION ÉCHEC VT ────────────────────────────────────\n// Si VT est indisponible, le workflow NE DOIT PAS s'arrêter\n// L'alerte analyste doit quand même partir\nvar vtFailed = !!(\n  vtResponse.error          ||\n  vtResponse.code           ||\n  (vtResponse.statusCode && vtResponse.statusCode >= 400) ||\n  !vtResponse.data\n);\n\nif (vtFailed) {\n  console.log('[SOAR-002] WARN: VirusTotal indisponible ou quota dépassé — enrichissement ignoré, triage continue');\n\n  var trailFail = Array.isArray(incident.audit_trail) ? incident.audit_trail : [];\n  trailFail.push(now + ' | ENRICHMENT | VT_AUTO | INDISPONIBLE — triage sans enrichissement VT');\n\n  // Mettre à jour le store avec le statut d'enrichissement partiel\n  if (incident.incident_id && incident.incident_id !== 'UNKNOWN' && store[incident.incident_id]) {\n    try {\n      var storedFail        = JSON.parse(store[incident.incident_id]);\n      storedFail.vt_verdict = 'UNAVAILABLE';\n      storedFail.vt_error   = true;\n      storedFail.etat_soar  = 'q2_Enrichissement_Partiel';\n      storedFail.audit_trail = trailFail;\n      store[incident.incident_id] = JSON.stringify(storedFail);\n    } catch(e) {}\n  }\n\n  return [{ json: Object.assign({}, incident, {\n    vt_score    : 0,\n    vt_verdict  : 'UNAVAILABLE',\n    vt_error    : true,\n    vt_malicious: 0,\n    vt_suspicious: 0,\n    vt_total_av : 0,\n    vt_country  : 'Unknown',\n    vt_asn_owner: 'Unknown',\n    audit_trail : trailFail,\n    etat_soar   : 'q2_Enrichissement_Partiel'\n  }) }];\n}\n\n// ── EXTRACTION RÉPONSE VT ─────────────────────────────────\nvar attrs     = vtResponse.data ? (vtResponse.data.attributes || {}) : {};\nvar stats     = attrs.last_analysis_stats || {};\nvar malicious = stats.malicious  || 0;\nvar suspicious= stats.suspicious || 0;\nvar harmless  = stats.harmless   || 0;\nvar total     = malicious + suspicious + harmless + (stats.undetected || 0);\n\nvar vtScore  = total > 0 ? Math.round(((malicious + suspicious) / total) * 100) : 0;\nvar country  = attrs.country  || 'Unknown';\nvar asOwner  = attrs.as_owner || 'Unknown';\n\nvar vtVerdict = 'UNKNOWN';\nif (vtScore >= 50)      vtVerdict = 'MALICIOUS';\nelse if (vtScore >= 15) vtVerdict = 'SUSPICIOUS';\nelse if (total > 0)     vtVerdict = 'CLEAN';\n\n// ── RÉÉVALUATION PRIORITÉ SELON VT ───────────────────────\nvar newPriority = incident.priority       || 'P1';\nvar newSeverity = incident.severity       || 'HIGH';\nvar newScore    = Number(incident.severity_score) || 75;\n\nif (vtVerdict === 'MALICIOUS') {\n  newPriority = 'P0';\n  newSeverity = 'CRITICAL';\n  newScore    = Math.min(100, newScore + 25);\n} else if (vtVerdict === 'SUSPICIOUS') {\n  // Suspicious : monter d'un cran mais pas forcément P0\n  if (newPriority === 'P2' || newPriority === 'P3') newPriority = 'P1';\n  if (newPriority === 'P1') newSeverity = 'HIGH';\n  newScore = Math.min(100, newScore + 15);\n}\n\nvar trail = Array.isArray(incident.audit_trail) ? incident.audit_trail : [];\ntrail.push(\n  now +\n  ' | ENRICHMENT | VT_AUTO | Score: ' + vtScore +\n  '/100 — Verdict: ' + vtVerdict +\n  ' — Country: ' + country +\n  ' — ASN: ' + asOwner +\n  ' — Detections: ' + malicious + '/' + total\n);\n\n// ── MISE À JOUR STORE ─────────────────────────────────────\nif (incident.incident_id && incident.incident_id !== 'UNKNOWN' && store[incident.incident_id]) {\n  try {\n    var stored            = JSON.parse(store[incident.incident_id]);\n    stored.priority       = newPriority;\n    stored.severity       = newSeverity;\n    stored.severity_score = newScore;\n    stored.vt_score       = vtScore;\n    stored.vt_verdict     = vtVerdict;\n    stored.vt_country     = country;\n    stored.vt_asn_owner   = asOwner;\n    stored.audit_trail    = trail;\n    stored.etat_soar      = 'q2_Enrichissement';\n    store[incident.incident_id] = JSON.stringify(stored);\n  } catch(e) {\n    console.log('[SOAR-002] WARN: Impossible de mettre à jour le store VT pour: ' + incident.incident_id);\n  }\n}\n\nreturn [{ json: Object.assign({}, incident, {\n  vt_score      : vtScore,\n  vt_malicious  : malicious,\n  vt_suspicious : suspicious,\n  vt_verdict    : vtVerdict,\n  vt_country    : country,\n  vt_asn_owner  : asOwner,\n  vt_total_av   : total,\n  priority      : newPriority,\n  severity      : newSeverity,\n  severity_score: newScore,\n  audit_trail   : trail,\n  etat_soar     : 'q2_Enrichissement'\n}) }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        0
+      ],
+      "id": "f02ca239-4a2b-4a12-a13a-84ea893edadd",
+      "name": "VT_Enrichissement"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "soar-trigger",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        96
+      ],
+      "id": "b01266d2-5075-47e8-b05f-99af48ce5c3e",
+      "name": "TriggerBF",
+      "webhookId": "soar-trigger-bf-001"
+    },
+    {
+      "parameters": {
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ipAddress",
+              "value": "={{ $json.source_ip }}"
+            },
+            {
+              "name": "maxAgeInDays",
+              "value": "90"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "KEY",
+              "value": "={{ $vars.ABUSEIPDB_KEY }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        896,
+        0
+      ],
+      "id": "839c535b-0426-4548-834b-b4b02e9d621d",
+      "name": "HTTP_AbuseIPDB_Lookup"
+    },
+    {
+      "parameters": {
+        "jsCode": "// AbuseIPDB Enrichissement\nvar abuseResponse = $input.first().json;\nvar store = $getWorkflowStaticData('global');\nvar lastId = store['LAST_INCIDENT'];\nvar incident = {};\nif (lastId) {\n  try { incident = JSON.parse(store[lastId] || '{}'); } catch(e) {}\n}\n\nvar failed = !abuseResponse.data;\nif (failed) {\n  return [{ json: Object.assign({}, incident, {\n    abuse_score  : 0,\n    abuse_country: 'Unknown',\n    abuse_isp    : 'Unknown',\n    abuse_verdict: 'UNAVAILABLE'\n  }) }];\n}\n\nvar d = abuseResponse.data;\nvar score = d.abuseConfidenceScore || 0;\nvar verdict = score >= 75 ? 'MALICIOUS' : score >= 25 ? 'SUSPICIOUS' : 'CLEAN';\n\nvar trail = Array.isArray(incident.audit_trail) ? incident.audit_trail : [];\ntrail.push(new Date().toISOString() + ' | ENRICHMENT | ABUSEIPDB | Score: ' + score +\n  '% — Country: ' + (d.countryCode || 'Unknown') + ' — ISP: ' + (d.isp || 'Unknown'));\n\nreturn [{ json: Object.assign({}, incident, {\n  abuse_score  : score,\n  abuse_country: d.countryCode || 'Unknown',\n  abuse_isp    : d.isp || 'Unknown',\n  abuse_verdict: verdict,\n  audit_trail  : trail\n}) }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "id": "4b9a750f-8f36-42e5-aeff-89c12c2d785f",
+      "name": "Code_AbuseIPDB_Enrich"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "incidents",
+          "mode": "list",
+          "cachedResultName": "incidents"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sla_breached": false,
+            "correlated": false,
+            "id": 0,
+            "sla_minutes": 0,
+            "vt_score": "={{ $json.vt_score }}",
+            "risk_score": 0,
+            "vt_verdict": "={{ $json.vt_verdict }}",
+            "priority": "={{ $json.priority }}",
+            "severity": "={{ $json.severity }}",
+            "severity_score": "={{ $json.severity_score }}",
+            "etat_soar": "={{ $json.etat_soar }}",
+            "audit_trail": "={{ JSON.stringify($json.audit_trail) }}",
+            "abuse_score": "={{ $json.abuse_score }}",
+            "abuse_country": "={{ $json.abuse_country }}",
+            "abuse_isp": "={{ $json.abuse_isp }}",
+            "abuse_verdict": "={{ $json.abuse_verdict }}"
+          },
+          "matchingColumns": [
+            "incident_id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_id",
+              "displayName": "incident_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_type",
+              "displayName": "incident_type",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_ip",
+              "displayName": "source_ip",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "username",
+              "displayName": "username",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity_score",
+              "displayName": "severity_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tech",
+              "displayName": "mitre_tech",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_name",
+              "displayName": "mitre_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tactic",
+              "displayName": "mitre_tactic",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_due",
+              "displayName": "sla_due",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_minutes",
+              "displayName": "sla_minutes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_breached",
+              "displayName": "sla_breached",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_verdict",
+              "displayName": "vt_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_by",
+              "displayName": "decided_by",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_at",
+              "displayName": "decided_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decision",
+              "displayName": "decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_soar",
+              "displayName": "etat_soar",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "closed_at",
+              "displayName": "closed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "audit_trail",
+              "displayName": "audit_trail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_siem",
+              "displayName": "etat_siem",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correlated",
+              "displayName": "correlated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correl_types",
+              "displayName": "correl_types",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_score",
+              "displayName": "vt_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_country",
+              "displayName": "vt_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_asn_owner",
+              "displayName": "vt_asn_owner",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "firewall_rule",
+              "displayName": "firewall_rule",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "last_escalation_sent_at",
+              "displayName": "last_escalation_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "first_alert_at",
+              "displayName": "first_alert_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_score",
+              "displayName": "abuse_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_country",
+              "displayName": "abuse_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_isp",
+              "displayName": "abuse_isp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_verdict",
+              "displayName": "abuse_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1568,
+        0
+      ],
+      "id": "ba7cb758-2da2-420d-bc82-fc394eb6c268",
+      "name": "DB_UpdateEnrichissement",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "soar-bf-decision",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        896
+      ],
+      "id": "d806da12-0b61-49e6-9b64-ab462102b930",
+      "name": "DecisionAnalyste",
+      "webhookId": "31103ef1-6872-4b3e-890b-9910a81b497a"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "incidents",
+          "mode": "list",
+          "cachedResultName": "incidents"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sla_breached": false,
+            "correlated": false,
+            "id": 0,
+            "severity_score": 0,
+            "sla_minutes": 0,
+            "vt_score": 0,
+            "risk_score": 0,
+            "status": "={{ $json.status }}",
+            "etat_soar": "={{ $json.etat_soar }}",
+            "closed_at": "={{ $json.closed_at }}",
+            "decided_by": "={{ $json.decided_by }}",
+            "decided_at": "={{ $json.decided_at }}",
+            "decision": "={{ $json.decision }}",
+            "firewall_rule": "={{ $json.firewall_rule }}",
+            "audit_trail": "={{ JSON.stringify($json.audit_trail) }}",
+            "abuse_score": 0
+          },
+          "matchingColumns": [
+            "incident_id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_id",
+              "displayName": "incident_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_type",
+              "displayName": "incident_type",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_ip",
+              "displayName": "source_ip",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "username",
+              "displayName": "username",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity_score",
+              "displayName": "severity_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tech",
+              "displayName": "mitre_tech",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_name",
+              "displayName": "mitre_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tactic",
+              "displayName": "mitre_tactic",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_due",
+              "displayName": "sla_due",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_minutes",
+              "displayName": "sla_minutes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_breached",
+              "displayName": "sla_breached",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_verdict",
+              "displayName": "vt_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_by",
+              "displayName": "decided_by",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_at",
+              "displayName": "decided_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decision",
+              "displayName": "decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_soar",
+              "displayName": "etat_soar",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "closed_at",
+              "displayName": "closed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "audit_trail",
+              "displayName": "audit_trail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_siem",
+              "displayName": "etat_siem",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correlated",
+              "displayName": "correlated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correl_types",
+              "displayName": "correl_types",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_score",
+              "displayName": "vt_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_country",
+              "displayName": "vt_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_asn_owner",
+              "displayName": "vt_asn_owner",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "firewall_rule",
+              "displayName": "firewall_rule",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "last_escalation_sent_at",
+              "displayName": "last_escalation_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "first_alert_at",
+              "displayName": "first_alert_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "abuse_score",
+              "displayName": "abuse_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_country",
+              "displayName": "abuse_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_isp",
+              "displayName": "abuse_isp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_verdict",
+              "displayName": "abuse_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2016,
+        416
+      ],
+      "id": "64954d35-dd3d-427a-8533-787e38194472",
+      "name": "DB_UpdateClosed",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "incidents",
+          "mode": "list",
+          "cachedResultName": "incidents"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sla_breached": false,
+            "correlated": false,
+            "id": 0,
+            "severity_score": 0,
+            "sla_minutes": 0,
+            "vt_score": 0,
+            "risk_score": 0,
+            "status": "ESCALATED",
+            "etat_soar": "q5_Escalation",
+            "decided_by": "={{ $json.decided_by }}",
+            "decided_at": "={{ $json.decided_at }}",
+            "decision": "={{ $json.decision }}",
+            "audit_trail": "={{ JSON.stringify($json.audit_trail) }}",
+            "abuse_score": 0
+          },
+          "matchingColumns": [
+            "incident_id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_id",
+              "displayName": "incident_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_type",
+              "displayName": "incident_type",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_ip",
+              "displayName": "source_ip",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "username",
+              "displayName": "username",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity_score",
+              "displayName": "severity_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tech",
+              "displayName": "mitre_tech",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_name",
+              "displayName": "mitre_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mitre_tactic",
+              "displayName": "mitre_tactic",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_due",
+              "displayName": "sla_due",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_minutes",
+              "displayName": "sla_minutes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sla_breached",
+              "displayName": "sla_breached",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_verdict",
+              "displayName": "vt_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_by",
+              "displayName": "decided_by",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decided_at",
+              "displayName": "decided_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "decision",
+              "displayName": "decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_soar",
+              "displayName": "etat_soar",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "closed_at",
+              "displayName": "closed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "audit_trail",
+              "displayName": "audit_trail",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "etat_siem",
+              "displayName": "etat_siem",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correlated",
+              "displayName": "correlated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "correl_types",
+              "displayName": "correl_types",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_score",
+              "displayName": "vt_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_country",
+              "displayName": "vt_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vt_asn_owner",
+              "displayName": "vt_asn_owner",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "firewall_rule",
+              "displayName": "firewall_rule",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "last_escalation_sent_at",
+              "displayName": "last_escalation_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "first_alert_at",
+              "displayName": "first_alert_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_score",
+              "displayName": "abuse_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_country",
+              "displayName": "abuse_country",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_isp",
+              "displayName": "abuse_isp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "abuse_verdict",
+              "displayName": "abuse_verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1568,
+        1024
+      ],
+      "id": "221385dd-d572-4f61-afdb-b1c0f3469809",
+      "name": "DB_UpdateEscaladed",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Code_GenerateOTP\n// ============================================================\n\nvar input = $input.first().json;\nvar now   = new Date().toISOString();\n\n// Vérifications préalables\nvar incidentId = String(input.incident_id || '').trim();\nvar phone      = String($vars.ANALYST_L1_PHONE || '').trim();\n\nif (!incidentId) {\n  return [{ json: {\n    error    : 'MISSING_INCIDENT_ID',\n    message  : 'incident_id manquant — impossible de générer OTP',\n    timestamp: now\n  }}];\n}\n\nvar supabaseOtpUrl = String($vars.SUPABASE_OTP_URL || '').trim();\nvar otpEdgeToken   = String($vars.OTP_EDGE_TOKEN   || '').trim();\n\nif (!supabaseOtpUrl || !otpEdgeToken) {\n  // FALLBACK DÉGRADÉ : Math.random() multi-source si Edge Function non configurée\n  // Acceptable pour développement/demo — PAS pour production\n  console.log('[SOAR-002][WARN] SUPABASE_OTP_URL ou OTP_EDGE_TOKEN non configuré — fallback Math.random');\n\n  var t1 = Date.now();\n  var t2 = new Date().getMilliseconds();\n  var r1 = Math.random();\n  var r2 = Math.random();\n  var r3 = Math.random();\n  var r4 = Math.random();\n  var r5 = Math.random();\n\n  // Combinaison de 5 valeurs aléatoires + timestamp pour maximiser l'entropie\n  var raw = Math.abs(\n    Math.floor(t1 % 1000000 * r1) ^\n    Math.floor(t2 * 997 * r2)     ^\n    Math.floor(r3 * 0xFFFFFF)     ^\n    Math.floor(r4 * 0xFFFFF)      ^\n    Math.floor(r5 * 0xFFFFF + t1 % 100)\n  );\n  var otpFallback = String((raw % 900000) + 100000).substring(0, 6);\n  if (!/^\\d{6}$/.test(otpFallback)) otpFallback = String(100000 + Math.floor(Math.random() * 899999));\n\n  var expiresFallback = new Date(Date.now() + 5 * 60 * 1000).toISOString();\n\n  return [{ json: buildOutput(input, otpFallback, expiresFallback, now, true) }];\n}\n\n// Mode normal : préparer le payload pour HTTP_GenerateOTP (nœud suivant)\nreturn [{ json: {\n  // Données incident passées en transit\n  _incident_data : input,\n  // Payload pour l'Edge Function\n  _otp_request   : {\n    incident_id: incidentId,\n    phone      : phone\n  },\n  _edge_url    : supabaseOtpUrl,\n  _edge_token  : otpEdgeToken,\n  timestamp    : now\n}}];\n\n// ── HELPER POUR LE FALLBACK ────────────────────────────────\nfunction buildOutput(inc, otpCode, expiresAt, ts, isFallback) {\n  var urlDisplay = String(inc.url || '');\n  if (urlDisplay.length > 60) urlDisplay = urlDisplay.substring(0, 57) + '...';\n\n  return {\n    incident_id    : inc.incident_id,\n    source_ip      : inc.source_ip,\n    username       : inc.username,\n    mitre_tech     : inc.mitre_tech,\n    mitre_name     : inc.mitre_name,\n    mitre_tactic   : inc.mitre_tactic,\n    severity       : inc.severity,\n    severity_score : inc.severity_score,\n    priority       : inc.priority,\n    sla_minutes    : inc.sla_minutes,\n    sla_due        : inc.sla_due,\n    vt_score       : inc.vt_score,\n    vt_verdict     : inc.vt_verdict,\n    vt_country     : inc.vt_country,\n    vt_asn_owner   : inc.vt_asn_owner,\n    abuse_score    : inc.abuse_score,\n    abuse_country  : inc.abuse_country,\n    abuse_isp      : inc.abuse_isp,\n    abuse_verdict  : inc.abuse_verdict,\n    audit_trail    : inc.audit_trail,\n    etat_soar      : inc.etat_soar,\n    otp_code       : otpCode,\n    otp_expires_at : expiresAt,\n    otp_fallback   : isFallback || false,\n    first_alert_at : ts,\n    whatsapp_message:\n      '🚨 ALERTE BRUTE-FORCE — ' + (inc.incident_id || 'INC-???') + '\\n' +\n      '━━━━━━━━━━━━━━━━━━━━━━\\n' +\n      '📍 IP Source  : ' + (inc.source_ip || '?') + '\\n' +\n      '🔴 Priorité   : ' + (inc.priority || 'P1') + '\\n' +\n      '⚠️  Sévérité   : ' + (inc.severity || 'HIGH') + '\\n' +\n      '🛡️  MITRE      : ' + (inc.mitre_tech || 'T1110') + ' — ' + (inc.mitre_name || 'Brute Force') + '\\n' +\n      '🌍 Pays VT    : ' + (inc.vt_country || 'Inconnu') + '\\n' +\n      '━━━━━━━━━━━━━━━━━━━━━━\\n' +\n      '➤ BLOQUER : répondez BF-OUI-' + otpCode + '\\n' +\n      '➤ IGNORER : répondez BF-NON-' + otpCode + '\\n' +\n      '⏰ Code valide 5 minutes uniquement'\n  };\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        0
+      ],
+      "id": "355ddb73-1849-4e7f-9754-2ec0840eb591",
+      "name": "Code_GenerateOTP"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO otp_challenges (incident_id, otp_code, phone)\nVALUES ($1, $2, $3)\nON CONFLICT (incident_id) DO UPDATE SET\n  otp_code   = EXCLUDED.otp_code,\n  expires_at = NOW() + INTERVAL '5 minutes',\n  used       = FALSE;",
+        "options": {
+          "queryReplacement": "=$1={{ $json.incident_id }},$2={{ $json.otp_code }},$3={{ $vars.ANALYST_L1_PHONE }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2224,
+        0
+      ],
+      "id": "1e9bcd9e-f68a-49fe-904c-9bfdf36aa267",
+      "name": "DB_SaveOTP",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT incident_id, otp_code, phone, expires_at\nFROM otp_challenges\nWHERE otp_code = $1\n  AND used = FALSE\n  AND expires_at > NOW()\nORDER BY created_at DESC\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "=$1={{ $json.otp_code }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        896,
+        800
+      ],
+      "id": "fe53cbdf-451b-4ea9-81f1-b1e95caf3441",
+      "name": "DB_ValidateOTP",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Code_RetryLogic (NOUVEAU NŒUD)\n// Retry avec backoff exponentiel, max 3 tentatives\n// ============================================================\n\nconst store = $getWorkflowStaticData('global');\nconst input = $input.first().json;\nconst ts    = new Date().toISOString();\n\nconst retryKey = 'RETRY_' + (input.incident_id || 'unknown');\nlet retryState = {};\ntry { retryState = JSON.parse(store[retryKey] || '{}'); }\ncatch(e) { retryState = {}; }\n\nconst attempt  = (retryState.attempt || 0) + 1;\nconst MAX      = 3;\nconst delay_ms = 1000 * Math.pow(2, attempt - 1);\n// Tentative 1 : 1s | Tentative 2 : 2s | Tentative 3 : 4s\n\nconsole.log('[SOAR-002][RETRY] Tentative ' + attempt + '/' + MAX +\n  ' — Incident: ' + (input.incident_id || 'unknown') +\n  ' — Délai: ' + delay_ms + 'ms');\n\nstore[retryKey] = JSON.stringify({ attempt, ts: Date.now() });\n\nif (attempt <= MAX) {\n  return [{ json: {\n    ...input,\n    _retry_attempt: attempt,\n    _retry_delay  : delay_ms,\n    _should_retry : true,\n    _dead_letter  : false,\n    timestamp     : ts\n  }}];\n}\n\n// Max atteint → dead-letter\ndelete store[retryKey];\nconsole.log('[SOAR-002][DEAD-LETTER] Abandon après ' + MAX +\n  ' tentatives — ' + (input.incident_id || 'unknown'));\n\nreturn [{ json: {\n  ...input,\n  _retry_attempt: attempt,\n  _should_retry : false,\n  _dead_letter  : true,\n  _error        : 'MAX_RETRIES_EXCEEDED — SIM-004 non joignable après 3 tentatives',\n  timestamp     : ts\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        656
+      ],
+      "id": "49f6242b-168e-4ada-ae7a-710a574bc011",
+      "name": "Code_RetryLogic"
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.ceil($json._retry_delay / 1000) }}"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2240,
+        832
+      ],
+      "id": "519faa59-9db7-4888-b717-6651b3665a78",
+      "name": "Wait",
+      "webhookId": "49877e0e-23ed-4e62-b710-7daa407d5a5d"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "={{ $vars.ANALYST_L2_PHONE }}",
+        "toWhatsapp": true,
+        "message": "=🔴 DEAD-LETTER — {{ $json.incident_id }} ━━━━━━━━━━━━━━━━━━━━━━━━━ ACTION FIREWALL ÉCHOUÉE après 3 tentatives IP à bloquer manuellement : {{ $json.source_ip }} Erreur : SIM-004 non joignable ━━━━━━━━━━━━━━━━━━━━━━━━━ → INTERVENTION MANUELLE sur PaloAlto-NGFW-01 → Créer règle DENY src={{ $json.source_ip }} dst=ANY",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        608
+      ],
+      "id": "8d96ba63-39ab-47e1-b0da-cfbf17123670",
+      "name": "WhatsApp dead-letter",
+      "credentials": {
+        "twilioApi": {
+          "id": "8H5G9PqkaJfT4Cbg",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "2a3f1c1b-28c3-4101-9b8d-b2633c0d65ee",
+              "leftValue": "={{ $json._dead_letter }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2016,
+        656
+      ],
+      "id": "d9f1893f-3028-4dea-9fa6-45892d03f2a3",
+      "name": "IF_DeadLetterOuRetry"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE otp_challenges\nSET used = TRUE\nWHERE otp_code = $1\n  AND incident_id = $2;",
+        "options": {
+          "queryReplacement": "=$1={{ $json.otp_code }},$2={{ $json.incident_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        672,
+        800
+      ],
+      "id": "44cfbe76-62f2-4fcc-800c-d1a9d98a5d8b",
+      "name": "DB_MarkOTPUsed",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "iZHEGrelNifD5lLX",
+          "name": "Postgres_SOC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f1bfc131-cc75-488e-be3a-136dde1e5cc4",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        448,
+        96
+      ],
+      "id": "3eea820a-779b-4ebb-8cd5-95b1cf194a79",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        672,
+        192
+      ],
+      "id": "1e52a393-78e7-40a6-910a-2c94689a9425",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "d2ed3dc2-fa4c-47db-8c32-beb1fde847e1",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        448,
+        896
+      ],
+      "id": "5b6d13ae-5643-46ba-804d-e312787cf188",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        672,
+        992
+      ],
+      "id": "492dcc24-0a3c-4579-8fef-919a7b2896b8",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SOAR-002 — Code_BuildOTPMessage\n// ============================================================\n\nvar edgeResponse  = $input.first().json;    // réponse de l'Edge Function\nvar incidentData  = $('Code_GenerateOTP').first().json._incident_data || {};\nvar now           = new Date().toISOString();\n\n// Vérifier que l'Edge Function a répondu correctement\nif (edgeResponse.error || !edgeResponse.otp_code) {\n  console.log('[SOAR-002][ERROR] Edge Function OTP échouée: ' + JSON.stringify(edgeResponse).substring(0, 200));\n  // Fallback : extraire l'OTP fallback du nœud précédent si disponible\n  // (cas où le nœud Code_GenerateOTP a utilisé le mode dégradé)\n  var fallbackData = $('Code_GenerateOTP').first().json;\n  if (fallbackData.otp_code) {\n    console.log('[SOAR-002][WARN] Utilisation OTP fallback Math.random');\n    return [{ json: fallbackData }];\n  }\n  return [{ json: {\n    error    : 'OTP_GENERATION_FAILED',\n    message  : 'Impossible de générer OTP: ' + (edgeResponse.message || 'erreur inconnue'),\n    timestamp: now\n  }}];\n}\n\nvar otpCode    = String(edgeResponse.otp_code);\nvar expiresAt  = String(edgeResponse.expires_at || new Date(Date.now() + 5 * 60 * 1000).toISOString());\n\n// Récupérer les données incident depuis le nœud Code_GenerateOTP\nvar inc = incidentData;\n\nvar whatsappMsg =\n  '🚨 ALERTE BRUTE-FORCE — ' + (inc.incident_id || 'INC-???') + '\\n' +\n  '━━━━━━━━━━━━━━━━━━━━━━\\n' +\n  '📍 IP Source  : ' + (inc.source_ip || '?') + '\\n' +\n  '🔴 Priorité   : ' + (inc.priority || 'P1') + '\\n' +\n  '⚠️  Sévérité   : ' + (inc.severity || 'HIGH') + '\\n' +\n  '🛡️  MITRE      : ' + (inc.mitre_tech || 'T1110') + ' — ' + (inc.mitre_name || 'Brute Force') + '\\n' +\n  '🌍 Pays VT    : ' + (inc.vt_country || 'Inconnu') + '\\n' +\n  '━━━━━━━━━━━━━━━━━━━━━━\\n' +\n  '➤ BLOQUER : répondez BF-OUI-' + otpCode + '\\n' +\n  '➤ IGNORER : répondez BF-NON-' + otpCode + '\\n' +\n  '⏰ Code valide 5 minutes uniquement';\n\nreturn [{ json: {\n  incident_id    : inc.incident_id,\n  source_ip      : inc.source_ip,\n  username       : inc.username,\n  mitre_tech     : inc.mitre_tech,\n  mitre_name     : inc.mitre_name,\n  mitre_tactic   : inc.mitre_tactic,\n  severity       : inc.severity,\n  severity_score : inc.severity_score,\n  priority       : inc.priority,\n  sla_minutes    : inc.sla_minutes,\n  sla_due        : inc.sla_due,\n  vt_score       : inc.vt_score,\n  vt_verdict     : inc.vt_verdict,\n  vt_country     : inc.vt_country,\n  vt_asn_owner   : inc.vt_asn_owner,\n  abuse_score    : inc.abuse_score,\n  abuse_country  : inc.abuse_country,\n  abuse_isp      : inc.abuse_isp,\n  abuse_verdict  : inc.abuse_verdict,\n  audit_trail    : inc.audit_trail,\n  etat_soar      : inc.etat_soar,\n  otp_code       : otpCode,\n  otp_expires_at : expiresAt,\n  otp_secure     : true,\n  first_alert_at : now,\n  whatsapp_message: whatsappMsg\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        0
+      ],
+      "id": "ae70f93e-a883-41ac-a56a-debfb4a4c754",
+      "name": "Code_BuildOTPMessage"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Code_Triage_Incident": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_Traitement_Decision": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF_OUI_ou_NON": {
+      "main": [
+        [
+          {
+            "node": "Code_Containment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code_Escalade_L2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_Containment": {
+      "main": [
+        [
+          {
+            "node": "HTTP_Block_IP_Firewall",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP_Block_IP_Firewall": {
+      "main": [
+        [
+          {
+            "node": "Code_Cloture_Incident",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code_RetryLogic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_Cloture_Incident": {
+      "main": [
+        [
+          {
+            "node": "DB_UpdateClosed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_Escalade_L2": {
+      "main": [
+        [
+          {
+            "node": "DB_UpdateEscaladed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VT_IP_Lookup": {
+      "main": [
+        [
+          {
+            "node": "HTTP_AbuseIPDB_Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VT_Enrichissement": {
+      "main": [
+        [
+          {
+            "node": "DB_UpdateEnrichissement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "TriggerBF": {
+      "main": [
+        [
+          {
+            "node": "Code_Triage_Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP_AbuseIPDB_Lookup": {
+      "main": [
+        [
+          {
+            "node": "Code_AbuseIPDB_Enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_AbuseIPDB_Enrich": {
+      "main": [
+        [
+          {
+            "node": "VT_Enrichissement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_UpdateEnrichissement": {
+      "main": [
+        [
+          {
+            "node": "Code_GenerateOTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DecisionAnalyste": {
+      "main": [
+        [
+          {
+            "node": "Code_Traitement_Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_UpdateClosed": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp_Cloture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_UpdateEscaladed": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp_Escalade_L2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_GenerateOTP": {
+      "main": [
+        [
+          {
+            "node": "Code_BuildOTPMessage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_SaveOTP": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp_Alerte_Analyste",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_ValidateOTP": {
+      "main": [
+        [
+          {
+            "node": "IF_OUI_ou_NON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_RetryLogic": {
+      "main": [
+        [
+          {
+            "node": "IF_DeadLetterOuRetry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "HTTP_Block_IP_Firewall",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF_DeadLetterOuRetry": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp dead-letter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB_MarkOTPUsed": {
+      "main": [
+        [
+          {
+            "node": "DB_ValidateOTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "VT_IP_Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "DB_MarkOTPUsed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code_BuildOTPMessage": {
+      "main": [
+        [
+          {
+            "node": "DB_SaveOTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "2a31766b-ccdb-4be0-aab3-402710bf1a45",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "7e20f16afa1f2ac92a7e3b7a480575dcdbea5aadb4b0260e8293755288b187b4"
+  },
+  "nodeGroups": [],
+  "id": "NMjMtvQlkj7fYjjF",
+  "tags": []
+}
