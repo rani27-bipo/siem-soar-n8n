@@ -1,0 +1,10 @@
+.env
+.env.local
+*.env
+n8n_variable.txt
+secrets/
+node-compile-cache/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
