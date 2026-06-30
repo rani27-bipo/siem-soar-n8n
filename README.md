@@ -69,7 +69,7 @@ Le projet contient **un seul automate fini formel** (SIEM-001) et **deux pipelin
 
 Véritable FSM à 5 états, persistée en base (table `fsm_sessions`) pour survivre aux redémarrages de l'instance n8n. Table de transition δ(état, événement) → état, alphabet fixe `{auth_fail, port_scan, priv_escalation, phishing, data_exfil, timeout, resolved}`, états accepteurs `q3` et `q4`.
 
-![Automate fini SIEM-001](images/fsm_siem001_automate.png)
+![Automate fini SIEM-001](images/fsm_siem001_bruteforce.png)
 
 | État | Sévérité | Priorité | Déclenche une alerte |
 |------|----------|----------|------------------------|
