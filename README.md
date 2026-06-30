@@ -302,7 +302,7 @@ Projet académique à des fins éducatives. Toutes les valeurs dans `.env.exampl
 
 ## Auteur
 
-**[ZOUBDANE RANYA]** — Étudiante en Cybersécurité | ENSAM Casablanca
+ZOUBDANE RANYA — Étudiante en Cybersécurité | ENSAM Casablanca
 Spécialisation : Blue Team · SOC · Détection & Réponse aux incidents
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5?logo=linkedin)](https://linkedin.com/in/TON_PROFIL)
