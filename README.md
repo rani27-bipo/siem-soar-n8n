@@ -154,6 +154,7 @@ Le schéma complet avec index partiels, triggers, fonctions de purge et RLS est 
 ## Structure du projet
 siem-soar-n8n/
 ├── README.md
+
 ├── .env.example                          # variables d'environnement — modèle
 ├── .gitignore
 ├── workflows/                            # 10 workflows n8n exportés en JSON
