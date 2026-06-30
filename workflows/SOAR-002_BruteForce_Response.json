@@ -1,5 +1,5 @@
 {
-  "name": "SOAR-002_BruteForce_Response_FIXED",
+  "name": "SOAR-002_BruteForce_Response",
   "nodes": [
     {
       "parameters": {
